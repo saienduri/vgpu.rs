@@ -11,7 +11,8 @@ members = [
   "crates/http-bidir-comm",
   "crates/bootstrap",
   "crates/integration-test",
-  "crates/erl"
+  "crates/erl",
+  "crates/hip-limiter"
 ]
 
 [workspace.dependencies]
