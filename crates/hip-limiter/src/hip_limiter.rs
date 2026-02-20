@@ -311,11 +311,10 @@ fn init_hooks() {
     let limiter = match GLOBAL_LIMITER.get() {
         Some(limiter) => limiter,
         None => {
-            if let Some(reason) = GLOBAL_LIMITER_ERROR.get() {
-                panic!("GLOBAL_LIMITER initialization failed: {reason}");
-            } else {
-                panic!("GLOBAL_LIMITER not initialized: init has not run");
-            }
+            // Limiter failed to initialize (e.g., no hypervisor running).
+            // Gracefully skip hooks — the library becomes a passthrough.
+            report_limiter_not_initialized();
+            return;
         }
     };
 
