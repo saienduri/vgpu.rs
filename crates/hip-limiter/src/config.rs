@@ -48,13 +48,15 @@ fn request_pod_info(
     let token = read_service_account_token()?;
     let container_pid = std::process::id();
     let container_name = env::var("CONTAINER_NAME").unwrap_or_default();
+    let pod_name = env::var("POD_NAME").unwrap_or_default();
+    let pod_namespace = env::var("POD_NAMESPACE").unwrap_or_default();
 
     tracing::Span::current().record("container_pid", container_pid);
 
     let client = build_http_client();
     let url = format!("http://{hypervisor_ip}:{hypervisor_port}/api/v1/pod");
 
-    tracing::debug!(url = %url, "Requesting pod information");
+    tracing::debug!(url = %url, pod_name = %pod_name, pod_namespace = %pod_namespace, "Requesting pod information");
 
     let request_start = std::time::Instant::now();
 
@@ -64,7 +66,13 @@ fn request_pod_info(
         .query(&[("container_pid", container_pid.to_string())]);
 
     if !container_name.is_empty() {
-        request = request.query(&[("container_name", container_name)]);
+        request = request.query(&[("container_name", &container_name)]);
+    }
+    if !pod_name.is_empty() {
+        request = request.query(&[("pod_name", &pod_name)]);
+    }
+    if !pod_namespace.is_empty() {
+        request = request.query(&[("pod_namespace", &pod_namespace)]);
     }
 
     let response = request

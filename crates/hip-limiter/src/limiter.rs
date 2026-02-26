@@ -59,10 +59,11 @@ impl Limiter {
         let mut gpu_idx_uuids = Vec::new();
         for uuid in &gpu_uuids {
             // AMD GPU UUIDs are PCI BDF-based: "AMD-GPU-0000:03:00.0"
-            let target_bdf = uuid
-                .strip_prefix("AMD-GPU-")
-                .unwrap_or(uuid)
-                .to_lowercase();
+            // The Go hypervisor lowercases UUIDs, so handle both cases.
+            let lowered = uuid.to_lowercase();
+            let target_bdf = lowered
+                .strip_prefix("amd-gpu-")
+                .unwrap_or(&lowered);
 
             let mut found = false;
             for device_index in 0..device_count {
@@ -144,10 +145,10 @@ impl Limiter {
         let pci_bus_id_lower = pci_bus_id.to_lowercase();
 
         for (idx, uuid) in &self.gpu_idx_uuids {
-            let target_bdf = uuid
-                .strip_prefix("AMD-GPU-")
-                .unwrap_or(uuid)
-                .to_lowercase();
+            let lowered = uuid.to_lowercase();
+            let target_bdf = lowered
+                .strip_prefix("amd-gpu-")
+                .unwrap_or(&lowered);
             if pci_bus_id_lower == target_bdf {
                 self.hip_device_mapping
                     .insert(hip_device, (*idx, uuid.clone()));
