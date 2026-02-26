@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -37,6 +38,10 @@ pub(crate) struct Limiter {
     hip_device_mapping: DashMap<HipDevice, (usize, String)>,
     gpu_idx_uuids: Vec<(usize, String)>,
     isolation: Option<String>,
+    /// Tracks pointer address -> (device_index, allocation_size) for free hooks.
+    /// Process-local: pointer addresses are virtual and only meaningful within this process.
+    /// The actual pod_memory_used counter lives in SHM (shared across processes).
+    allocation_tracker: DashMap<usize, (usize, u64)>,
 }
 
 impl std::fmt::Debug for Limiter {
@@ -98,6 +103,7 @@ impl Limiter {
             hip_device_mapping: DashMap::new(),
             gpu_idx_uuids,
             isolation,
+            allocation_tracker: DashMap::new(),
         })
     }
 
@@ -201,6 +207,54 @@ impl Limiter {
         } else {
             Err(Error::DeviceNotConfigured(raw_device_index))
         }
+    }
+
+    /// Record a successful allocation: update SHM pod_memory_used and track ptr→size.
+    pub(crate) fn record_allocation(
+        &self,
+        device_idx: usize,
+        ptr: usize,
+        size: u64,
+    ) {
+        if size == 0 {
+            return;
+        }
+        let handle = match self.get_or_init_shared_memory() {
+            Ok(handle) => handle,
+            Err(error) => {
+                tracing::warn!("Cannot record allocation, SHM unavailable: {error}");
+                return;
+            }
+        };
+        let state = handle.get_state();
+        state.with_device(
+            device_idx,
+            |device| device.device_info.pod_memory_used.fetch_add(size, Ordering::AcqRel),
+            |device| device.device_info.pod_memory_used.fetch_add(size, Ordering::AcqRel),
+        );
+        self.allocation_tracker.insert(ptr, (device_idx, size));
+    }
+
+    /// Record a free: look up the pointer's size, decrement SHM pod_memory_used.
+    /// Returns true if the pointer was tracked (and decremented), false if unknown.
+    pub(crate) fn record_free(&self, ptr: usize) -> bool {
+        let Some((_, (device_idx, size))) = self.allocation_tracker.remove(&ptr) else {
+            return false;
+        };
+        let handle = match self.get_or_init_shared_memory() {
+            Ok(handle) => handle,
+            Err(error) => {
+                tracing::warn!("Cannot record free, SHM unavailable: {error}");
+                return true;
+            }
+        };
+        let state = handle.get_state();
+        state.with_device(
+            device_idx,
+            |device| device.device_info.pod_memory_used.fetch_sub(size, Ordering::AcqRel),
+            |device| device.device_info.pod_memory_used.fetch_sub(size, Ordering::AcqRel),
+        );
+        true
     }
 
     pub(crate) fn isolation(&self) -> Option<&str> {

@@ -13,10 +13,14 @@ use crate::Limiter;
 use crate::GLOBAL_LIMITER;
 
 /// Check pod-level memory allocation and execute the allocation if within limits.
+/// On success, records the allocation in the tracker and updates SHM pod_memory_used.
 ///
-/// Returns the original allocation result on success, or hipErrorOutOfMemory if denied.
+/// $out_ptr: the *mut *mut c_void that receives the allocated pointer
+/// $request_size: allocation size in bytes (u64)
+/// $alloc_name: string label for logging
+/// $alloc_fn: closure that calls the native allocation function
 macro_rules! check_and_alloc {
-    ($request_size:expr, $alloc_name:expr, $alloc_fn:expr) => {{
+    ($out_ptr:expr, $request_size:expr, $alloc_name:expr, $alloc_fn:expr) => {{
         let device_result = with_device!(|limiter: &crate::limiter::Limiter, device_idx: usize| {
             (limiter.get_pod_memory_usage(device_idx), device_idx)
         });
@@ -33,7 +37,16 @@ macro_rules! check_and_alloc {
                     );
                     HIP_ERROR_OUT_OF_MEMORY
                 }
-                Ok(_) => $alloc_fn(),
+                Ok(_) => {
+                    let result = $alloc_fn();
+                    if result == HIP_SUCCESS && $request_size > 0 {
+                        let allocated_ptr = *$out_ptr as usize;
+                        if let Some(limiter) = GLOBAL_LIMITER.get() {
+                            limiter.record_allocation(device_idx, allocated_ptr, $request_size);
+                        }
+                    }
+                    result
+                }
                 Err(Error::DeviceNotHealthy { device_idx, last_heartbeat }) => {
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -68,7 +81,7 @@ pub(crate) unsafe fn hip_malloc_detour(
     size: usize,
 ) -> HipError {
     let request_size = size as u64;
-    check_and_alloc!(request_size, "hipMalloc", || {
+    check_and_alloc!(ptr, request_size, "hipMalloc", || {
         FN_HIP_MALLOC(ptr, size)
     })
 }
@@ -80,7 +93,7 @@ pub(crate) unsafe fn hip_ext_malloc_with_flags_detour(
     flags: c_uint,
 ) -> HipError {
     let request_size = size_bytes as u64;
-    check_and_alloc!(request_size, "hipExtMallocWithFlags", || {
+    check_and_alloc!(ptr, request_size, "hipExtMallocWithFlags", || {
         FN_HIP_EXT_MALLOC_WITH_FLAGS(ptr, size_bytes, flags)
     })
 }
@@ -92,7 +105,7 @@ pub(crate) unsafe fn hip_host_malloc_detour(
     flags: c_uint,
 ) -> HipError {
     let request_size = size as u64;
-    check_and_alloc!(request_size, "hipHostMalloc", || {
+    check_and_alloc!(ptr, request_size, "hipHostMalloc", || {
         FN_HIP_HOST_MALLOC(ptr, size, flags)
     })
 }
@@ -104,7 +117,7 @@ pub(crate) unsafe fn hip_malloc_managed_detour(
     flags: c_uint,
 ) -> HipError {
     let request_size = size as u64;
-    check_and_alloc!(request_size, "hipMallocManaged", || {
+    check_and_alloc!(dev_ptr, request_size, "hipMallocManaged", || {
         FN_HIP_MALLOC_MANAGED(dev_ptr, size, flags)
     })
 }
@@ -116,7 +129,7 @@ pub(crate) unsafe fn hip_malloc_async_detour(
     stream: HipStream,
 ) -> HipError {
     let request_size = size as u64;
-    check_and_alloc!(request_size, "hipMallocAsync", || {
+    check_and_alloc!(dev_ptr, request_size, "hipMallocAsync", || {
         FN_HIP_MALLOC_ASYNC(dev_ptr, size, stream)
     })
 }
@@ -129,7 +142,7 @@ pub(crate) unsafe fn hip_malloc_from_pool_async_detour(
     stream: HipStream,
 ) -> HipError {
     let request_size = size as u64;
-    check_and_alloc!(request_size, "hipMallocFromPoolAsync", || {
+    check_and_alloc!(dev_ptr, request_size, "hipMallocFromPoolAsync", || {
         FN_HIP_MALLOC_FROM_POOL_ASYNC(dev_ptr, size, mem_pool, stream)
     })
 }
@@ -142,9 +155,44 @@ pub(crate) unsafe fn hip_malloc_pitch_detour(
     height: usize,
 ) -> HipError {
     let request_size = (width * height) as u64;
-    check_and_alloc!(request_size, "hipMallocPitch", || {
+    check_and_alloc!(ptr, request_size, "hipMallocPitch", || {
         FN_HIP_MALLOC_PITCH(ptr, pitch, width, height)
     })
+}
+
+// --- Free hooks ---
+
+#[hook_fn]
+pub(crate) unsafe fn hip_free_detour(ptr: *mut c_void) -> HipError {
+    if !ptr.is_null() {
+        if let Some(limiter) = GLOBAL_LIMITER.get() {
+            limiter.record_free(ptr as usize);
+        }
+    }
+    FN_HIP_FREE(ptr)
+}
+
+#[hook_fn]
+pub(crate) unsafe fn hip_host_free_detour(ptr: *mut c_void) -> HipError {
+    if !ptr.is_null() {
+        if let Some(limiter) = GLOBAL_LIMITER.get() {
+            limiter.record_free(ptr as usize);
+        }
+    }
+    FN_HIP_HOST_FREE(ptr)
+}
+
+#[hook_fn]
+pub(crate) unsafe fn hip_free_async_detour(
+    ptr: *mut c_void,
+    stream: HipStream,
+) -> HipError {
+    if !ptr.is_null() {
+        if let Some(limiter) = GLOBAL_LIMITER.get() {
+            limiter.record_free(ptr as usize);
+        }
+    }
+    FN_HIP_FREE_ASYNC(ptr, stream)
 }
 
 // --- Info spoofing hooks ---
@@ -284,6 +332,30 @@ pub(crate) unsafe fn enable_hooks(hook_manager: &mut HookManager) -> Result<(), 
         hip_malloc_pitch_detour,
         FnHip_malloc_pitch,
         FN_HIP_MALLOC_PITCH
+    )?;
+    replace_symbol!(
+        hook_manager,
+        Some("libamdhip64."),
+        "hipFree",
+        hip_free_detour,
+        FnHip_free,
+        FN_HIP_FREE
+    )?;
+    replace_symbol!(
+        hook_manager,
+        Some("libamdhip64."),
+        "hipHostFree",
+        hip_host_free_detour,
+        FnHip_host_free,
+        FN_HIP_HOST_FREE
+    )?;
+    replace_symbol!(
+        hook_manager,
+        Some("libamdhip64."),
+        "hipFreeAsync",
+        hip_free_async_detour,
+        FnHip_free_async,
+        FN_HIP_FREE_ASYNC
     )?;
     replace_symbol!(
         hook_manager,
