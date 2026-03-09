@@ -1,0 +1,16 @@
+[package]
+name = "hip-limiter-fuzz"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/simulated_limiter.rs"
+
+[dependencies]
+dashmap = { workspace = true }
+
+[dev-dependencies]
+proptest = "1.6"
+utils = { workspace = true }
+tempfile = { workspace = true }

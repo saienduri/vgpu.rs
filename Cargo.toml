@@ -12,7 +12,8 @@ members = [
   "crates/bootstrap",
   "crates/integration-test",
   "crates/erl",
-  "crates/hip-limiter"
+  "crates/hip-limiter",
+  "crates/hip-limiter-fuzz"
 ]
 
 [workspace.dependencies]
