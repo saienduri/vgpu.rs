@@ -1,6 +1,8 @@
 /target
 /crates/*/target
 logs
+__pycache__/
+*.pyc
 
 
 # START Ruler Generated Files
