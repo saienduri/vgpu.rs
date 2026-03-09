@@ -284,6 +284,31 @@ impl SharedDeviceInfoV2 {
         self.pod_memory_used.store(memory, Ordering::Release);
     }
 
+    /// Atomically subtract `size` from pod_memory_used, clamping at 0 to prevent
+    /// underflow wrapping on u64. Uses a CAS loop for correctness under contention.
+    /// Returns the value before subtraction.
+    pub fn saturating_fetch_sub_pod_memory_used(&self, size: u64) -> u64 {
+        loop {
+            let current = self.pod_memory_used.load(Ordering::Acquire);
+            let new_value = current.saturating_sub(size);
+            if self
+                .pod_memory_used
+                .compare_exchange_weak(current, new_value, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                if size > current {
+                    warn!(
+                        current,
+                        size,
+                        "pod_memory_used underflow prevented (V2): \
+                         attempted to subtract {size} from {current}, clamped to 0"
+                    );
+                }
+                return current;
+            }
+        }
+    }
+
     // ERL token-related methods
 
     pub fn get_erl_token_capacity(&self) -> f64 {
@@ -473,18 +498,13 @@ impl DeviceEntry {
         }
     }
 
-    /// Sets the device UUID atomically
-    pub fn set_uuid(&self, uuid: &str) {
+    /// Sets the device UUID. Must only be called during initialization before
+    /// any concurrent readers exist.
+    pub fn set_uuid(&mut self, uuid: &str) {
         let uuid_bytes = uuid.as_bytes();
         let copy_len = std::cmp::min(uuid_bytes.len(), MAX_UUID_LEN - 1);
-
-        // Clear the UUID array first
-        unsafe {
-            let uuid_ptr = self.uuid.as_ptr() as *mut u8;
-            std::ptr::write_bytes(uuid_ptr, 0, MAX_UUID_LEN);
-            // Copy the new UUID
-            std::ptr::copy_nonoverlapping(uuid_bytes.as_ptr(), uuid_ptr, copy_len);
-        }
+        self.uuid = [0; MAX_UUID_LEN];
+        self.uuid[..copy_len].copy_from_slice(&uuid_bytes[..copy_len]);
     }
 
     /// Gets the device UUID as a string, using cached value when possible
@@ -683,6 +703,22 @@ impl SharedDeviceState {
                 .get(index)
                 .filter(|device| device.is_active())
                 .map(f_v2),
+        }
+    }
+
+    /// Executes a single closure on the V2 device info, with a no-op fallback for V1.
+    /// Use this when V1 is never encountered in production (all new code is V2-only).
+    pub fn with_device_v2_or<T, F>(&self, index: usize, f: F) -> Option<T>
+    where
+        F: FnOnce(&DeviceEntryV2) -> T,
+    {
+        match self {
+            Self::V1(_) => None,
+            Self::V2(inner) => inner
+                .devices
+                .get(index)
+                .filter(|device| device.is_active())
+                .map(f),
         }
     }
 
@@ -904,7 +940,7 @@ impl SharedDeviceStateV2 {
     pub fn new(configs: &[DeviceConfig]) -> Self {
         let now = current_unix_timestamp();
 
-        let state = Self {
+        let mut state = Self {
             devices: std::array::from_fn(|_| DeviceEntry::new()),
             device_count: AtomicU32::new(0),
             last_heartbeat: AtomicU64::new(now),
@@ -923,7 +959,7 @@ impl SharedDeviceStateV2 {
                 continue;
             }
 
-            let device_entry = &state.devices[device_idx];
+            let device_entry = &mut state.devices[device_idx];
             if !device_entry.is_active() {
                 active_devices = active_devices.saturating_add(1);
             }
@@ -1068,7 +1104,7 @@ mod tests {
 
     #[test]
     fn device_entry_basic_operations() {
-        let entry = DeviceEntry::new();
+        let mut entry = DeviceEntry::new();
 
         // Test UUID operations
         entry.set_uuid("test-uuid-123");
