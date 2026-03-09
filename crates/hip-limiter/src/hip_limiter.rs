@@ -1,5 +1,4 @@
 use std::cell::Cell;
-use std::collections::HashSet;
 use std::env;
 use std::ffi::c_char;
 use std::ffi::c_void;
@@ -38,6 +37,7 @@ unsafe fn entry_point() {
 
     if !enable_hip_hooks {
         HOOKS_INITIALIZED.store(true, Ordering::Release);
+        return;
     }
 
     init_hooks();
@@ -83,78 +83,11 @@ pub(crate) fn mock_shm_path() -> Option<PathBuf> {
         .ok()
 }
 
-fn remap_visible_devices(allocated_devices: &[String]) -> Result<String, String> {
-    if let Ok(last_remapped) = env::var("TF_REMAPPED") {
-        if let Ok(current) = env::var("HIP_VISIBLE_DEVICES") {
-            if current.trim() == last_remapped {
-                return Ok(last_remapped);
-            }
-        } else {
-            let result = allocated_devices.join(",");
-            env::set_var("TF_REMAPPED", &result);
-            return Ok(result);
-        }
-    }
-
-    let original = env::var("HIP_VISIBLE_DEVICES").ok();
-    let Some(original) = original else {
-        let result = allocated_devices.join(",");
-        env::set_var("TF_REMAPPED", &result);
-        return Ok(result);
-    };
-
-    let trimmed = original.trim();
-    if trimmed.is_empty() {
-        let result = allocated_devices.join(",");
-        env::set_var("TF_REMAPPED", &result);
-        return Ok(result);
-    }
-
-    if trimmed.contains(',') {
-        let mut remapped = Vec::new();
-        for part in trimmed.split(',') {
-            let virtual_id = part.trim().parse::<usize>().map_err(|_| {
-                format!(
-                    "Invalid device ID in HIP_VISIBLE_DEVICES: '{}'",
-                    part.trim()
-                )
-            })?;
-            if virtual_id >= allocated_devices.len() {
-                return Err(format!(
-                    "Virtual device ID {} out of range (only {} device(s) allocated)",
-                    virtual_id,
-                    allocated_devices.len()
-                ));
-            }
-            remapped.push(allocated_devices[virtual_id].clone());
-        }
-        let result = remapped.join(",");
-        env::set_var("TF_REMAPPED", &result);
-        return Ok(result);
-    }
-
-    let virtual_id = trimmed
-        .parse::<usize>()
-        .map_err(|_| format!("Invalid device ID in HIP_VISIBLE_DEVICES: '{trimmed}'"))?;
-
-    if virtual_id >= allocated_devices.len() {
-        return Err(format!(
-            "Virtual device ID {} out of range (only {} device(s) allocated)",
-            virtual_id,
-            allocated_devices.len()
-        ));
-    }
-
-    let result = allocated_devices[virtual_id].clone();
-    env::set_var("TF_REMAPPED", &result);
-    Ok(result)
-}
-
 fn init_limiter() {
     static LIMITER_INITIALIZED: Once = Once::new();
     LIMITER_INITIALIZED.call_once(|| {
-        let hip = match hiplib::init_hiplib() {
-            Ok(hip) => hip,
+        match hiplib::init_hiplib() {
+            Ok(_) => {}
             Err(error) => {
                 record_limiter_error(format!("failed to initialize HIP library: {error}"));
                 return;
@@ -200,61 +133,11 @@ fn init_limiter() {
             }
         };
 
-        if !config.gpu_uuids.is_empty() {
-            let device_count = match hip.get_device_count() {
-                Ok(count) => count,
-                Err(error) => {
-                    record_limiter_error(format!("failed to get HIP device count: {error}"));
-                    return;
-                }
-            };
-
-            let lower_case_uuids: HashSet<_> = config
-                .gpu_uuids
-                .iter()
-                .map(|uuid| {
-                    uuid.strip_prefix("AMD-GPU-")
-                        .unwrap_or(uuid)
-                        .to_lowercase()
-                })
-                .collect();
-
-            let mut device_indices = Vec::new();
-            for device_index in 0..device_count {
-                let pci_bus_id = match hip.get_pci_bus_id(device_index) {
-                    Ok(id) => id.to_lowercase(),
-                    Err(error) => {
-                        record_limiter_error(format!(
-                            "failed to get PCI bus ID for device {device_index}: {error}"
-                        ));
-                        return;
-                    }
-                };
-
-                if lower_case_uuids.contains(&pci_bus_id) {
-                    device_indices.push(device_index.to_string());
-                }
-            }
-
-            if !device_indices.is_empty() {
-                device_indices.sort_by_key(|id| id.parse::<u32>().unwrap_or(u32::MAX));
-
-                let visible_devices = match remap_visible_devices(&device_indices) {
-                    Ok(devices) => devices,
-                    Err(error) => {
-                        record_limiter_error(error);
-                        return;
-                    }
-                };
-
-                tracing::info!(
-                    "Setting HIP_VISIBLE_DEVICES to {} (allocated devices: {})",
-                    &visible_devices,
-                    device_indices.join(",")
-                );
-                env::set_var("HIP_VISIBLE_DEVICES", &visible_devices);
-            }
-        }
+        // NOTE: Device visibility is the platform's responsibility (K8s device plugin),
+        // not the limiter's. The limiter enforces memory limits via SHM hooks on whichever
+        // GPUs are visible. We do not set HIP_VISIBLE_DEVICES here because the limiter's
+        // #[ctor] initializes the HIP runtime (via hipGetDeviceCount) before we could set
+        // it, and HIP only reads HIP_VISIBLE_DEVICES at first initialization.
 
         let limiter = match Limiter::new(config.gpu_uuids, config.isolation) {
             Ok(limiter) => limiter,
@@ -279,25 +162,30 @@ fn try_install_hip_hooks() {
         return;
     }
 
-    tracing::debug!("Installing HIP hooks...");
+    // Use Once to ensure only one thread attempts hook installation, even if
+    // multiple threads race past the HOOKS_INITIALIZED fast-path check above.
+    static INSTALL_ONCE: Once = Once::new();
+    INSTALL_ONCE.call_once(|| {
+        tracing::debug!("Installing HIP hooks...");
 
-    let install_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-        let mut hook_manager = HookManager::default();
-        detour::mem::enable_hooks(&mut hook_manager)
-    }));
+        let install_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            let mut hook_manager = HookManager::default();
+            detour::mem::enable_hooks(&mut hook_manager)
+        }));
 
-    match install_result {
-        Ok(Ok(())) => {
-            HOOKS_INITIALIZED.store(true, Ordering::Release);
-            tracing::debug!("HIP hooks installed successfully");
+        match install_result {
+            Ok(Ok(())) => {
+                HOOKS_INITIALIZED.store(true, Ordering::Release);
+                tracing::debug!("HIP hooks installed successfully");
+            }
+            Ok(Err(error)) => {
+                tracing::error!("HIP hooks installation failed: {error}");
+            }
+            Err(error) => {
+                tracing::error!("HIP hooks installation panicked: {error:?}");
+            }
         }
-        Ok(Err(error)) => {
-            tracing::error!("HIP hooks installation failed: {error}");
-        }
-        Err(error) => {
-            tracing::error!("HIP hooks installation panicked: {error:?}");
-        }
-    }
+    });
 }
 
 fn init_hooks() {
@@ -329,10 +217,7 @@ fn init_hooks() {
         return;
     }
 
-    let all_unlimited = GLOBAL_LIMITER
-        .get()
-        .map(|limiter| limiter.all_devices_unlimited())
-        .unwrap_or(false);
+    let all_unlimited = limiter.all_devices_unlimited();
 
     if should_skip_hooks_on_no_limit() && all_unlimited {
         tracing::info!("All devices have up_limit >= 100, skipping hooks installation");
@@ -408,123 +293,11 @@ unsafe extern "C" fn dlsym_detour(handle: *const c_void, symbol: *const c_char) 
         try_install_hip_hooks();
     }
 
-    FN_DLSYM(handle, symbol)
+    call_original_dlsym(handle, symbol)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use serial_test::serial;
-
-    #[test]
-    #[serial]
-    fn test_remap_single_device_valid() {
-        env::remove_var("HIP_VISIBLE_DEVICES");
-        env::remove_var("TF_REMAPPED");
-
-        env::set_var("HIP_VISIBLE_DEVICES", "0");
-        let allocated = vec!["2".to_string(), "3".to_string()];
-        let result = remap_visible_devices(&allocated);
-        assert_eq!(result, Ok("2".to_string()));
-
-        env::remove_var("HIP_VISIBLE_DEVICES");
-        env::remove_var("TF_REMAPPED");
-    }
-
-    #[test]
-    #[serial]
-    fn test_remap_single_device_out_of_range() {
-        env::remove_var("HIP_VISIBLE_DEVICES");
-        env::remove_var("TF_REMAPPED");
-
-        env::set_var("HIP_VISIBLE_DEVICES", "2");
-        let allocated = vec!["2".to_string(), "3".to_string()];
-        let result = remap_visible_devices(&allocated);
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .contains("Virtual device ID 2 out of range"));
-
-        env::remove_var("HIP_VISIBLE_DEVICES");
-        env::remove_var("TF_REMAPPED");
-    }
-
-    #[test]
-    #[serial]
-    fn test_remap_multiple_devices() {
-        env::remove_var("HIP_VISIBLE_DEVICES");
-        env::remove_var("TF_REMAPPED");
-
-        env::set_var("HIP_VISIBLE_DEVICES", "0,1");
-        let allocated = vec!["2".to_string(), "3".to_string()];
-        let result = remap_visible_devices(&allocated);
-        assert_eq!(result, Ok("2,3".to_string()));
-
-        env::remove_var("HIP_VISIBLE_DEVICES");
-        env::remove_var("TF_REMAPPED");
-    }
-
-    #[test]
-    #[serial]
-    fn test_remap_no_original_env() {
-        env::remove_var("HIP_VISIBLE_DEVICES");
-        env::remove_var("TF_REMAPPED");
-
-        let allocated = vec!["2".to_string(), "3".to_string()];
-        let result = remap_visible_devices(&allocated);
-        assert_eq!(result, Ok("2,3".to_string()));
-
-        env::remove_var("HIP_VISIBLE_DEVICES");
-        env::remove_var("TF_REMAPPED");
-    }
-
-    #[test]
-    #[serial]
-    fn test_remap_empty_original_env() {
-        env::remove_var("HIP_VISIBLE_DEVICES");
-        env::remove_var("TF_REMAPPED");
-
-        env::set_var("HIP_VISIBLE_DEVICES", "");
-        let allocated = vec!["2".to_string(), "3".to_string()];
-        let result = remap_visible_devices(&allocated);
-        assert_eq!(result, Ok("2,3".to_string()));
-
-        env::remove_var("HIP_VISIBLE_DEVICES");
-        env::remove_var("TF_REMAPPED");
-    }
-
-    #[test]
-    #[serial]
-    fn test_remap_invalid_device_id() {
-        env::remove_var("HIP_VISIBLE_DEVICES");
-        env::remove_var("TF_REMAPPED");
-
-        env::set_var("HIP_VISIBLE_DEVICES", "abc");
-        let allocated = vec!["2".to_string(), "3".to_string()];
-        let result = remap_visible_devices(&allocated);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Invalid device ID"));
-
-        env::remove_var("HIP_VISIBLE_DEVICES");
-        env::remove_var("TF_REMAPPED");
-    }
-
-    #[test]
-    #[serial]
-    fn test_inherited_value_unchanged() {
-        env::remove_var("HIP_VISIBLE_DEVICES");
-        env::remove_var("TF_REMAPPED");
-
-        env::set_var("TF_REMAPPED", "2");
-        env::set_var("HIP_VISIBLE_DEVICES", "2");
-        let allocated = vec!["1".to_string(), "2".to_string()];
-        let result = remap_visible_devices(&allocated);
-        assert_eq!(result, Ok("2".to_string()));
-
-        env::remove_var("HIP_VISIBLE_DEVICES");
-        env::remove_var("TF_REMAPPED");
-    }
-
     #[test]
     fn test_isolation_soft_should_not_skip() {
         let isolation = Some("soft");

@@ -21,10 +21,12 @@ pub(crate) enum Error {
     #[error("Device {0} not configured")]
     DeviceNotConfigured(usize),
 
-    #[error("Device {device_idx} not healthy, last heartbeat {last_heartbeat}")]
-    DeviceNotHealthy {
+    #[error("Allocation exceeds limit on device {device_idx}: used ({used}) + request ({request}) > limit ({limit})")]
+    OverLimit {
+        used: u64,
+        request: u64,
+        limit: u64,
         device_idx: usize,
-        last_heartbeat: u64,
     },
 
     #[error("Limiter not initialized")]
@@ -34,8 +36,9 @@ pub(crate) enum Error {
 pub(crate) struct Limiter {
     shared_memory_handle: OnceCell<Arc<SharedMemoryHandle>>,
     erl_kernel_limiter: OnceCell<KernelLimiter<ErlSharedMemoryAdapter<Arc<SharedMemoryHandle>>>>,
-    /// HIP device -> (raw_device_index, device_uuid)
+    /// Cache: HIP device ordinal -> (raw_device_index, device_uuid)
     hip_device_mapping: DashMap<HipDevice, (usize, String)>,
+    /// Configured devices: (raw_device_index, device_uuid) sorted/deduped from config
     gpu_idx_uuids: Vec<(usize, String)>,
     isolation: Option<String>,
     /// Tracks pointer address -> (device_index, allocation_size) for free hooks.
@@ -50,6 +53,44 @@ impl std::fmt::Debug for Limiter {
     }
 }
 
+/// Normalize an AMD GPU UUID to a PCI BDF string for matching.
+/// AMD GPU UUIDs are PCI BDF-based: "AMD-GPU-0000:03:00.0"
+/// The Go hypervisor lowercases UUIDs, so we normalize to lowercase
+/// and strip the "amd-gpu-" prefix.
+pub(crate) fn normalize_uuid_to_bdf(uuid: &str) -> String {
+    let lowered = uuid.to_lowercase();
+    lowered
+        .strip_prefix("amd-gpu-")
+        .unwrap_or(&lowered)
+        .to_string()
+}
+
+/// Match config GPU UUIDs against enumerated HIP devices by PCI bus ID.
+/// Returns sorted (device_index, uuid) pairs for matched devices.
+///
+/// `gpu_uuids`: UUIDs from the hypervisor config (may have "AMD-GPU-" prefix, mixed case)
+/// `enumerated_devices`: (device_index, pci_bus_id) pairs from HIP device enumeration
+pub(crate) fn resolve_device_indices(
+    gpu_uuids: &[String],
+    enumerated_devices: &[(i32, String)],
+) -> Vec<(usize, String)> {
+    let mut resolved = Vec::new();
+    for uuid in gpu_uuids {
+        let target_bdf = normalize_uuid_to_bdf(uuid);
+        if let Some((device_index, _)) = enumerated_devices
+            .iter()
+            .find(|(_, pci_bus_id)| pci_bus_id.to_lowercase() == target_bdf)
+        {
+            resolved.push((*device_index as usize, uuid.clone()));
+        } else {
+            tracing::warn!(uuid = uuid.as_str(), "No HIP device found matching UUID, skipping");
+        }
+    }
+    resolved.sort_by_key(|(idx, _)| *idx);
+    resolved.dedup_by_key(|(idx, _)| *idx);
+    resolved
+}
+
 impl Limiter {
     pub(crate) fn new(
         mut gpu_uuids: Vec<String>,
@@ -61,36 +102,13 @@ impl Limiter {
         let hip = hiplib::hiplib();
         let device_count = hip.get_device_count().map_err(Error::Hip)?;
 
-        let mut gpu_idx_uuids = Vec::new();
-        for uuid in &gpu_uuids {
-            // AMD GPU UUIDs are PCI BDF-based: "AMD-GPU-0000:03:00.0"
-            // The Go hypervisor lowercases UUIDs, so handle both cases.
-            let lowered = uuid.to_lowercase();
-            let target_bdf = lowered
-                .strip_prefix("amd-gpu-")
-                .unwrap_or(&lowered);
-
-            let mut found = false;
-            for device_index in 0..device_count {
-                let pci_bus_id = hip
-                    .get_pci_bus_id(device_index)
-                    .map_err(Error::Hip)?
-                    .to_lowercase();
-
-                if pci_bus_id == target_bdf {
-                    gpu_idx_uuids.push((device_index as usize, uuid.clone()));
-                    found = true;
-                    break;
-                }
-            }
-
-            if !found {
-                tracing::warn!(
-                    uuid = uuid.as_str(),
-                    "No HIP device found matching UUID, skipping"
-                );
-            }
+        let mut enumerated_devices = Vec::new();
+        for device_index in 0..device_count {
+            let pci_bus_id = hip.get_pci_bus_id(device_index).map_err(Error::Hip)?;
+            enumerated_devices.push((device_index, pci_bus_id));
         }
+
+        let gpu_idx_uuids = resolve_device_indices(&gpu_uuids, &enumerated_devices);
 
         tracing::info!(
             "Limiter initialized with GPU UUIDs and indices: {:?}",
@@ -126,6 +144,7 @@ impl Limiter {
         })
     }
 
+    /// Used by ERL compute throttling (not yet wired for hip-limiter).
     #[allow(dead_code)]
     fn get_or_init_kernel_limiter(
         &self,
@@ -151,10 +170,7 @@ impl Limiter {
         let pci_bus_id_lower = pci_bus_id.to_lowercase();
 
         for (idx, uuid) in &self.gpu_idx_uuids {
-            let lowered = uuid.to_lowercase();
-            let target_bdf = lowered
-                .strip_prefix("amd-gpu-")
-                .unwrap_or(&lowered);
+            let target_bdf = normalize_uuid_to_bdf(uuid);
             if pci_bus_id_lower == target_bdf {
                 self.hip_device_mapping
                     .insert(hip_device, (*idx, uuid.clone()));
@@ -173,29 +189,15 @@ impl Limiter {
         let state = handle.get_state();
 
         if !state.is_healthy(Duration::from_secs(2)) {
-            let last_heartbeat = state.get_last_heartbeat();
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
             tracing::warn!(
-                now = now,
-                "{}",
-                Error::DeviceNotHealthy {
-                    device_idx: raw_device_index,
-                    last_heartbeat,
-                }
+                device_idx = raw_device_index,
+                last_heartbeat = state.get_last_heartbeat(),
+                "Stale heartbeat detected, continuing with enforcement"
             );
         }
 
-        if let Some((used, limit)) = state.with_device(
+        if let Some((used, limit)) = state.with_device_v2_or(
             raw_device_index,
-            |device| {
-                (
-                    device.device_info.get_pod_memory_used(),
-                    device.device_info.get_mem_limit(),
-                )
-            },
             |device| {
                 (
                     device.device_info.get_pod_memory_used(),
@@ -209,7 +211,113 @@ impl Limiter {
         }
     }
 
-    /// Record a successful allocation: update SHM pod_memory_used and track ptr→size.
+    /// Atomically reserve memory by incrementing pod_memory_used BEFORE calling the
+    /// native allocator. Returns Ok(previous_used) if the reservation fits within the
+    /// limit, or Err if it would exceed the limit (and rolls back the increment).
+    ///
+    /// This eliminates the TOCTOU race in the old check-then-allocate pattern: the
+    /// atomic fetch_add IS the reservation, so concurrent threads cannot both pass
+    /// the limit check with stale values.
+    ///
+    /// Under high contention with tight limits, multiple threads may each fetch_add
+    /// past the limit simultaneously and all roll back, causing under-utilization
+    /// (fewer successes than slots available). This is safe — conservative direction.
+    pub(crate) fn try_reserve(
+        &self,
+        device_idx: usize,
+        size: u64,
+    ) -> Result<u64, Error> {
+        if size == 0 {
+            return Ok(0);
+        }
+        // Guard against u64 overflow: fetch_add wraps modularly, so a huge size
+        // would corrupt pod_memory_used transiently until rollback. Any realistic
+        // GPU allocation is well under this threshold.
+        const MAX_ALLOC_SIZE: u64 = u64::MAX / 2;
+        if size > MAX_ALLOC_SIZE {
+            return Err(Error::OverLimit {
+                used: 0,
+                request: size,
+                limit: 0,
+                device_idx,
+            });
+        }
+        let handle = self.get_or_init_shared_memory()?;
+        let state = handle.get_state();
+
+        if !state.is_healthy(Duration::from_secs(2)) {
+            tracing::warn!(
+                device_idx = device_idx,
+                last_heartbeat = state.get_last_heartbeat(),
+                "Stale heartbeat detected, continuing with enforcement"
+            );
+        }
+
+        // NOTE: Between this fetch_add and the potential rollback fetch_sub below,
+        // pod_memory_used holds a transiently elevated value (actual_used + size).
+        // A concurrent hipMemGetInfo reader may see slightly less free memory than
+        // reality during this nanosecond-scale window. This is conservative (never
+        // over-reports free memory) and acceptable for lock-free atomics.
+        //
+        // Both fetch_add and get_mem_limit are read in a single with_device call
+        // to avoid a race where the device becomes unavailable between calls.
+        let reserve_result = state.with_device_v2_or(
+            device_idx,
+            |device| {
+                let previous_used = device.device_info.pod_memory_used.fetch_add(size, Ordering::AcqRel);
+                let mem_limit = device.device_info.get_mem_limit();
+                (previous_used, mem_limit)
+            },
+        );
+
+        let Some((previous_used, mem_limit)) = reserve_result else {
+            return Err(Error::DeviceNotConfigured(device_idx));
+        };
+
+        let new_used = previous_used.saturating_add(size);
+
+        if new_used > mem_limit {
+            // Over limit — roll back the reservation
+            state.with_device_v2_or(
+                device_idx,
+                |device| device.device_info.saturating_fetch_sub_pod_memory_used(size),
+            );
+            return Err(Error::OverLimit {
+                used: previous_used,
+                request: size,
+                limit: mem_limit,
+                device_idx,
+            });
+        }
+
+        Ok(previous_used)
+    }
+
+    /// Roll back a reservation when the native allocator fails after try_reserve succeeded.
+    pub(crate) fn rollback_reservation(
+        &self,
+        device_idx: usize,
+        size: u64,
+    ) {
+        if size == 0 {
+            return;
+        }
+        let handle = match self.get_or_init_shared_memory() {
+            Ok(handle) => handle,
+            Err(error) => {
+                tracing::warn!("Cannot rollback reservation, SHM unavailable: {error}");
+                return;
+            }
+        };
+        let state = handle.get_state();
+        state.with_device_v2_or(
+            device_idx,
+            |device| device.device_info.saturating_fetch_sub_pod_memory_used(size),
+        );
+    }
+
+    /// Record a successful allocation in the pointer tracker (after try_reserve + native alloc).
+    /// The SHM pod_memory_used was already incremented by try_reserve.
     pub(crate) fn record_allocation(
         &self,
         device_idx: usize,
@@ -219,19 +327,6 @@ impl Limiter {
         if size == 0 {
             return;
         }
-        let handle = match self.get_or_init_shared_memory() {
-            Ok(handle) => handle,
-            Err(error) => {
-                tracing::warn!("Cannot record allocation, SHM unavailable: {error}");
-                return;
-            }
-        };
-        let state = handle.get_state();
-        state.with_device(
-            device_idx,
-            |device| device.device_info.pod_memory_used.fetch_add(size, Ordering::AcqRel),
-            |device| device.device_info.pod_memory_used.fetch_add(size, Ordering::AcqRel),
-        );
         self.allocation_tracker.insert(ptr, (device_idx, size));
     }
 
@@ -244,15 +339,19 @@ impl Limiter {
         let handle = match self.get_or_init_shared_memory() {
             Ok(handle) => handle,
             Err(error) => {
-                tracing::warn!("Cannot record free, SHM unavailable: {error}");
+                // KNOWN LIMITATION: The pointer was removed from allocation_tracker but
+                // pod_memory_used was not decremented. This causes a permanent accounting
+                // leak of `size` bytes in SHM. However, SHM being unavailable indicates
+                // the hypervisor is already in a degraded state, so this is acceptable.
+                // Re-inserting the entry would cause a double-free on retry.
+                tracing::warn!(size = size, device_idx = device_idx, "Cannot record free, SHM unavailable: {error}");
                 return true;
             }
         };
         let state = handle.get_state();
-        state.with_device(
+        state.with_device_v2_or(
             device_idx,
-            |device| device.device_info.pod_memory_used.fetch_sub(size, Ordering::AcqRel),
-            |device| device.device_info.pod_memory_used.fetch_sub(size, Ordering::AcqRel),
+            |device| device.device_info.saturating_fetch_sub_pod_memory_used(size),
         );
         true
     }
@@ -274,9 +373,8 @@ impl Limiter {
 
         for (idx, _uuid) in &self.gpu_idx_uuids {
             let up_limit = state
-                .with_device(
+                .with_device_v2_or(
                     *idx,
-                    |device| device.device_info.get_up_limit(),
                     |device| device.device_info.get_up_limit(),
                 )
                 .unwrap_or(0);
@@ -327,6 +425,7 @@ mod tests {
         }
     }
 
+    /// Smoke test: verify get/set on SharedDeviceInfo and free = limit - used.
     #[test]
     fn test_memory_info_reporting() {
         let mock = MockSharedMemory::new(1000, 80, 1024 * 1024 * 1024);
@@ -342,6 +441,7 @@ mod tests {
         assert_eq!(free, 512 * 1024 * 1024);
     }
 
+    /// Edge case: saturating_sub prevents underflow when used >= limit.
     #[test]
     fn test_memory_info_edge_cases() {
         let mock = MockSharedMemory::new(1000, 80, 1024);
@@ -359,5 +459,171 @@ mod tests {
         let used = state.get_pod_memory_used();
         let free = total.saturating_sub(used);
         assert_eq!(free, 0);
+    }
+
+    // --- UUID normalization tests ---
+    //
+    // Real formats from production:
+    //   HIP runtime returns:     "0000:75:00.0" (lowercase hex, domain:bus:device.function)
+    //   Go hypervisor constructs: strings.ToLower("AMD-GPU-" + BDF) = "amd-gpu-0000:75:00.0"
+    //   C provider uses:          snprintf("AMD-GPU-%04x:%02x:%02x.%x") = "AMD-GPU-0000:75:00.0"
+    //
+    // The normalizer must handle all three sources.
+
+    #[test]
+    fn test_normalize_uuid_strips_lowercase_prefix() {
+        // Go hypervisor format (always lowercase)
+        assert_eq!(
+            super::normalize_uuid_to_bdf("amd-gpu-0000:75:00.0"),
+            "0000:75:00.0"
+        );
+    }
+
+    #[test]
+    fn test_normalize_uuid_strips_uppercase_prefix() {
+        // C provider format (uppercase prefix, lowercase hex)
+        assert_eq!(
+            super::normalize_uuid_to_bdf("AMD-GPU-0000:75:00.0"),
+            "0000:75:00.0"
+        );
+    }
+
+    #[test]
+    fn test_normalize_uuid_bare_bdf() {
+        // Raw PCI bus ID as HIP returns it
+        assert_eq!(
+            super::normalize_uuid_to_bdf("0000:75:00.0"),
+            "0000:75:00.0"
+        );
+    }
+
+    #[test]
+    fn test_normalize_uuid_mixed_case_hex() {
+        // Hypothetical: uppercase hex digits in bus ID
+        assert_eq!(
+            super::normalize_uuid_to_bdf("AMD-GPU-0000:F5:00.0"),
+            "0000:f5:00.0"
+        );
+    }
+
+    // --- Device resolution tests ---
+    //
+    // Uses real MI325X PCI bus IDs from production 8-GPU node:
+    //   Device 0: 0000:75:00.0    Device 4: 0000:f5:00.0
+    //   Device 1: 0000:05:00.0    Device 5: 0000:85:00.0
+    //   Device 2: 0000:65:00.0    Device 6: 0000:e5:00.0
+    //   Device 3: 0000:15:00.0    Device 7: 0000:95:00.0
+
+    fn devices(pairs: &[(i32, &str)]) -> Vec<(i32, String)> {
+        pairs.iter().map(|(i, s)| (*i, s.to_string())).collect()
+    }
+
+    fn uuids(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Real MI325X 8-GPU enumeration
+    fn mi325x_devices() -> Vec<(i32, String)> {
+        devices(&[
+            (0, "0000:75:00.0"),
+            (1, "0000:05:00.0"),
+            (2, "0000:65:00.0"),
+            (3, "0000:15:00.0"),
+            (4, "0000:f5:00.0"),
+            (5, "0000:85:00.0"),
+            (6, "0000:e5:00.0"),
+            (7, "0000:95:00.0"),
+        ])
+    }
+
+    #[test]
+    fn test_resolve_picks_correct_gpus_on_mi325x() {
+        // Pod allocated GPUs 0 and 4 (PCI slots 75 and f5)
+        let config = uuids(&["amd-gpu-0000:75:00.0", "amd-gpu-0000:f5:00.0"]);
+        let result = super::resolve_device_indices(&config, &mi325x_devices());
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].0, 0); // device 0 = 0000:75:00.0
+        assert_eq!(result[1].0, 4); // device 4 = 0000:f5:00.0
+    }
+
+    #[test]
+    fn test_resolve_single_gpu_allocation() {
+        // Pod allocated only GPU 3 (PCI slot 15)
+        let config = uuids(&["amd-gpu-0000:15:00.0"]);
+        let result = super::resolve_device_indices(&config, &mi325x_devices());
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, 3);
+    }
+
+    #[test]
+    fn test_resolve_all_8_gpus() {
+        // Pod allocated all 8 GPUs
+        let config = uuids(&[
+            "amd-gpu-0000:75:00.0",
+            "amd-gpu-0000:05:00.0",
+            "amd-gpu-0000:65:00.0",
+            "amd-gpu-0000:15:00.0",
+            "amd-gpu-0000:f5:00.0",
+            "amd-gpu-0000:85:00.0",
+            "amd-gpu-0000:e5:00.0",
+            "amd-gpu-0000:95:00.0",
+        ]);
+        let result = super::resolve_device_indices(&config, &mi325x_devices());
+
+        assert_eq!(result.len(), 8);
+        // Should be sorted by device index
+        let indices: Vec<usize> = result.iter().map(|(idx, _)| *idx).collect();
+        assert_eq!(indices, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn test_resolve_c_provider_format() {
+        // C provider uses uppercase prefix: "AMD-GPU-0000:75:00.0"
+        let config = uuids(&["AMD-GPU-0000:85:00.0"]);
+        let result = super::resolve_device_indices(&config, &mi325x_devices());
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, 5); // device 5 = 0000:85:00.0
+    }
+
+    #[test]
+    fn test_resolve_missing_uuid_skipped() {
+        // One real device, one that doesn't exist on this node
+        let config = uuids(&["amd-gpu-0000:75:00.0", "amd-gpu-0000:aa:00.0"]);
+        let result = super::resolve_device_indices(&config, &mi325x_devices());
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, 0);
+    }
+
+    #[test]
+    fn test_resolve_empty_config() {
+        let result = super::resolve_device_indices(&uuids(&[]), &mi325x_devices());
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_empty_enumerated() {
+        let config = uuids(&["amd-gpu-0000:75:00.0"]);
+        let result = super::resolve_device_indices(&config, &[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_sorted_regardless_of_config_order() {
+        // Config lists devices in reverse order; result should still be sorted by index
+        let config = uuids(&[
+            "amd-gpu-0000:95:00.0", // device 7
+            "amd-gpu-0000:05:00.0", // device 1
+            "amd-gpu-0000:e5:00.0", // device 6
+        ]);
+        let result = super::resolve_device_indices(&config, &mi325x_devices());
+
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].0, 1); // device 1
+        assert_eq!(result[1].0, 6); // device 6
+        assert_eq!(result[2].0, 7); // device 7
     }
 }

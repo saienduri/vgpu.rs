@@ -9,11 +9,34 @@ use crate::hiplib::{HipDevice, HipError, HipMemPool, HipStream, HIP_ERROR_OUT_OF
                     HIP_ERROR_UNKNOWN, HIP_SUCCESS};
 use crate::limiter::Error;
 use crate::with_device;
-use crate::Limiter;
 use crate::GLOBAL_LIMITER;
 
-/// Check pod-level memory allocation and execute the allocation if within limits.
-/// On success, records the allocation in the tracker and updates SHM pod_memory_used.
+/// Map a reserve error to a HIP error code.
+fn handle_reserve_error(error: Error, alloc_name: &str) -> HipError {
+    match error {
+        Error::OverLimit { used, request, limit, device_idx } => {
+            tracing::warn!(
+                "Allocation denied by limiter ({}): used ({}) + request ({}) > limit ({}) device_idx: {}",
+                alloc_name, used, request, limit, device_idx
+            );
+            HIP_ERROR_OUT_OF_MEMORY
+        }
+        error => {
+            tracing::error!("Failed to reserve memory for {}: {error}", alloc_name);
+            HIP_ERROR_UNKNOWN
+        }
+    }
+}
+
+/// Reserve-then-allocate: atomically reserves memory in SHM before calling the native
+/// allocator, eliminating the TOCTOU race in the old check-then-allocate pattern.
+///
+/// Flow:
+/// 1. Atomically increment pod_memory_used (reserve)
+/// 2. If over limit → roll back, return OOM
+/// 3. Call native allocator
+/// 4. If native fails → roll back reservation
+/// 5. Record pointer in tracker
 ///
 /// $out_ptr: the *mut *mut c_void that receives the allocated pointer
 /// $request_size: allocation size in bytes (u64)
@@ -21,49 +44,26 @@ use crate::GLOBAL_LIMITER;
 /// $alloc_fn: closure that calls the native allocation function
 macro_rules! check_and_alloc {
     ($out_ptr:expr, $request_size:expr, $alloc_name:expr, $alloc_fn:expr) => {{
-        let device_result = with_device!(|limiter: &crate::limiter::Limiter, device_idx: usize| {
-            (limiter.get_pod_memory_usage(device_idx), device_idx)
-        });
-        match device_result {
-            Ok((result, device_idx)) => match result {
-                Ok((used, mem_limit)) if used.saturating_add($request_size) > mem_limit => {
-                    tracing::warn!(
-                        "Allocation denied by limiter ({}): used ({}) + request ({}) > limit ({}) device_idx: {}",
-                        $alloc_name,
-                        used,
-                        $request_size,
-                        mem_limit,
-                        device_idx
-                    );
-                    HIP_ERROR_OUT_OF_MEMORY
-                }
-                Ok(_) => {
+        match with_device!() {
+            Ok((limiter, device_idx)) => match limiter.try_reserve(device_idx, $request_size) {
+                Ok(_previous_used) => {
+                    // Reservation succeeded — call the native allocator
                     let result = $alloc_fn();
                     if result == HIP_SUCCESS && $request_size > 0 {
                         let allocated_ptr = *$out_ptr as usize;
-                        if let Some(limiter) = GLOBAL_LIMITER.get() {
+                        if allocated_ptr != 0 {
                             limiter.record_allocation(device_idx, allocated_ptr, $request_size);
+                        } else {
+                            // Native allocator returned success but null pointer — roll back reservation
+                            limiter.rollback_reservation(device_idx, $request_size);
                         }
+                    } else if result != HIP_SUCCESS && $request_size > 0 {
+                        // Native alloc failed — roll back the reservation
+                        limiter.rollback_reservation(device_idx, $request_size);
                     }
                     result
                 }
-                Err(Error::DeviceNotHealthy { device_idx, last_heartbeat }) => {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    tracing::warn!(
-                        now = now,
-                        device_idx = device_idx,
-                        last_heartbeat = last_heartbeat,
-                        "Device not healthy, allowing allocation as fallback"
-                    );
-                    $alloc_fn()
-                }
-                Err(error) => {
-                    tracing::error!("Failed to get pod memory usage: {error}");
-                    HIP_ERROR_UNKNOWN
-                }
+                Err(error) => handle_reserve_error(error, $alloc_name),
             },
             Err(error) => {
                 tracing::warn!("Device context error: {error}, falling back to native call");
@@ -147,6 +147,15 @@ pub(crate) unsafe fn hip_malloc_from_pool_async_detour(
     })
 }
 
+/// hipMallocPitch uses a custom flow instead of check_and_alloc! because the GPU
+/// allocates `pitch * height` bytes (where `pitch >= width` due to alignment), but
+/// we only know `pitch` after the native call returns. The flow:
+///
+/// 1. Reserve `width * height` (the user-requested size)
+/// 2. Call native hipMallocPitch → get actual `pitch`
+/// 3. If `pitch > width`, reserve the extra `(pitch - width) * height`
+///    - If that pushes over limit: rollback everything, free native alloc, return OOM
+/// 4. Record allocation with actual size `pitch * height`
 #[hook_fn]
 pub(crate) unsafe fn hip_malloc_pitch_detour(
     ptr: *mut *mut c_void,
@@ -154,45 +163,115 @@ pub(crate) unsafe fn hip_malloc_pitch_detour(
     width: usize,
     height: usize,
 ) -> HipError {
-    let request_size = (width * height) as u64;
-    check_and_alloc!(ptr, request_size, "hipMallocPitch", || {
-        FN_HIP_MALLOC_PITCH(ptr, pitch, width, height)
-    })
+    let estimated_size = match width.checked_mul(height) {
+        Some(size) => size as u64,
+        None => return HIP_ERROR_OUT_OF_MEMORY,
+    };
+
+    match with_device!() {
+        Ok((limiter, device_idx)) => match limiter.try_reserve(device_idx, estimated_size) {
+            Ok(_previous_used) => {
+                // Step 2: Call native allocator
+                let result = FN_HIP_MALLOC_PITCH(ptr, pitch, width, height);
+
+                if result != HIP_SUCCESS || estimated_size == 0 {
+                    if estimated_size > 0 {
+                        limiter.rollback_reservation(device_idx, estimated_size);
+                    }
+                    return result;
+                }
+
+                let allocated_ptr = *ptr as usize;
+                if allocated_ptr == 0 {
+                    limiter.rollback_reservation(device_idx, estimated_size);
+                    return result;
+                }
+
+                // Step 3: Check actual pitch and reserve the alignment overhead
+                let actual_pitch = *pitch;
+                let actual_size = match actual_pitch.checked_mul(height) {
+                    Some(size) => size as u64,
+                    None => {
+                        // Overflow — roll back and free
+                        limiter.rollback_reservation(device_idx, estimated_size);
+                        FN_HIP_FREE(*ptr);
+                        return HIP_ERROR_OUT_OF_MEMORY;
+                    }
+                };
+                let extra = actual_size.saturating_sub(estimated_size);
+
+                if extra > 0 {
+                    if let Err(_) = limiter.try_reserve(device_idx, extra) {
+                        // Actual size exceeds limit — roll back everything and free
+                        tracing::warn!(
+                            "hipMallocPitch: pitch ({}) > width ({}), actual size ({}) exceeds limit after alignment overhead — denying",
+                            actual_pitch, width, actual_size
+                        );
+                        limiter.rollback_reservation(device_idx, estimated_size);
+                        FN_HIP_FREE(*ptr);
+                        return HIP_ERROR_OUT_OF_MEMORY;
+                    }
+                }
+
+                // Step 4: Record with actual size (pitch * height)
+                limiter.record_allocation(device_idx, allocated_ptr, actual_size);
+                result
+            }
+            Err(error) => handle_reserve_error(error, "hipMallocPitch"),
+        },
+        Err(error) => {
+            tracing::warn!("Device context error: {error}, falling back to native hipMallocPitch");
+            FN_HIP_MALLOC_PITCH(ptr, pitch, width, height)
+        }
+    }
 }
 
 // --- Free hooks ---
 
+// Free hooks call the native free FIRST, then update accounting. This ordering is
+// conservative: if the native free succeeds but the process crashes before record_free,
+// pod_memory_used over-reports (safe — other pods see less available, not more). The
+// alternative (record_free first) risks under-reporting if native free fails, which
+// could allow overcommit.
 #[hook_fn]
 pub(crate) unsafe fn hip_free_detour(ptr: *mut c_void) -> HipError {
-    if !ptr.is_null() {
+    let result = FN_HIP_FREE(ptr);
+    if result == HIP_SUCCESS && !ptr.is_null() {
         if let Some(limiter) = GLOBAL_LIMITER.get() {
             limiter.record_free(ptr as usize);
         }
     }
-    FN_HIP_FREE(ptr)
+    result
 }
 
 #[hook_fn]
 pub(crate) unsafe fn hip_host_free_detour(ptr: *mut c_void) -> HipError {
-    if !ptr.is_null() {
+    let result = FN_HIP_HOST_FREE(ptr);
+    if result == HIP_SUCCESS && !ptr.is_null() {
         if let Some(limiter) = GLOBAL_LIMITER.get() {
             limiter.record_free(ptr as usize);
         }
     }
-    FN_HIP_HOST_FREE(ptr)
+    result
 }
 
+// NOTE: hipFreeAsync defers the actual GPU memory release until stream completion,
+// but we decrement pod_memory_used immediately. This is intentional: deferring the
+// decrement would over-report usage to other pods, causing unnecessary OOM denials.
+// If a subsequent hipMalloc fails because the GPU hasn't actually freed yet, the
+// check_and_alloc! macro handles it correctly (rolls back the reservation).
 #[hook_fn]
 pub(crate) unsafe fn hip_free_async_detour(
     ptr: *mut c_void,
     stream: HipStream,
 ) -> HipError {
-    if !ptr.is_null() {
+    let result = FN_HIP_FREE_ASYNC(ptr, stream);
+    if result == HIP_SUCCESS && !ptr.is_null() {
         if let Some(limiter) = GLOBAL_LIMITER.get() {
             limiter.record_free(ptr as usize);
         }
     }
-    FN_HIP_FREE_ASYNC(ptr, stream)
+    result
 }
 
 // --- Info spoofing hooks ---
@@ -202,38 +281,18 @@ pub(crate) unsafe fn hip_mem_get_info_detour(
     free: *mut usize,
     total: *mut usize,
 ) -> HipError {
-    let result = with_device!(|limiter: &Limiter, device_idx: usize| {
-        match limiter.get_pod_memory_usage(device_idx) {
+    match with_device!() {
+        Ok((limiter, device_idx)) => match limiter.get_pod_memory_usage(device_idx) {
             Ok((used, mem_limit)) => {
                 *total = mem_limit as usize;
                 *free = mem_limit.saturating_sub(used) as usize;
                 HIP_SUCCESS
             }
-            Err(Error::DeviceNotHealthy {
-                device_idx,
-                last_heartbeat,
-            }) => {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                tracing::warn!(
-                    now = now,
-                    device_idx = device_idx,
-                    last_heartbeat = last_heartbeat,
-                    "Device not healthy"
-                );
-                HIP_ERROR_UNKNOWN
-            }
             Err(error) => {
                 tracing::error!("Failed to get pod memory usage: {error}");
                 HIP_ERROR_UNKNOWN
             }
-        }
-    });
-
-    match result {
-        Ok(hip_result) => hip_result,
+        },
         Err(error) => {
             tracing::warn!("Device context error: {error}, falling back to native call");
             FN_HIP_MEM_GET_INFO(free, total)
@@ -249,7 +308,7 @@ pub(crate) unsafe fn hip_device_total_mem_detour(
     let limiter = match GLOBAL_LIMITER.get() {
         Some(limiter) => limiter,
         None => {
-            report_limiter_not_initialized();
+            crate::report_limiter_not_initialized();
             return FN_HIP_DEVICE_TOTAL_MEM(bytes, device);
         }
     };
@@ -270,10 +329,6 @@ pub(crate) unsafe fn hip_device_total_mem_detour(
             FN_HIP_DEVICE_TOTAL_MEM(bytes, device)
         }
     }
-}
-
-fn report_limiter_not_initialized() {
-    crate::report_limiter_not_initialized();
 }
 
 pub(crate) unsafe fn enable_hooks(hook_manager: &mut HookManager) -> Result<(), utils::HookError> {
