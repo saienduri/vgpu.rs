@@ -205,6 +205,41 @@ print("ALLOC_OK")
 hip.free_async(ptr, 0)
 hip.device_synchronize()
 """,
+    "hipHostAlloc": """\
+from hip_helper import HIPRuntime
+hip = HIPRuntime()
+ptr = hip.host_alloc(1024 * 1024, 0)
+print("ALLOC_OK")
+hip.host_free(ptr)
+""",
+    "hipMallocHost": """\
+from hip_helper import HIPRuntime
+hip = HIPRuntime()
+ptr = hip.malloc_host(1024 * 1024)
+print("ALLOC_OK")
+hip.host_free(ptr)
+""",
+    "hipMemAllocHost": """\
+from hip_helper import HIPRuntime
+hip = HIPRuntime()
+ptr = hip.mem_alloc_host(1024 * 1024)
+print("ALLOC_OK")
+hip.host_free(ptr)
+""",
+    "hipMallocPitch": """\
+from hip_helper import HIPRuntime
+hip = HIPRuntime()
+ptr, pitch = hip.malloc_pitch(1024, 1024)
+print("ALLOC_OK")
+hip.free(ptr)
+""",
+    "hipMalloc3D": """\
+from hip_helper import HIPRuntime
+hip = HIPRuntime()
+ptr, pitch, xsize, ysize = hip.malloc_3d(1024, 1024, 1)
+print("ALLOC_OK")
+hip.free(ptr)
+""",
 }
 
 
@@ -350,73 +385,67 @@ print("DONE")
         )
 
 
-class TestMallocPitchAlignmentOverhead:
-    """hipMallocPitch alignment overhead can push an allocation over the limit.
+def _discover_pitch(cts_factory, alloc_call, width, height, depth=None):
+    """Discover the GPU's actual pitch for a given allocation shape.
 
-    The limiter reserves width*height first, then after the native call discovers
-    the actual pitch, tries to reserve the extra (pitch-width)*height. If that
-    second reservation exceeds the limit, the limiter rolls back everything and
-    frees the native allocation (mem.rs lines 203-213).
-
-    This edge case is distinct from a simple over-limit pitch allocation — here,
-    width*height fits within the limit but pitch*height does not.
+    Returns (pitch, estimated_size, actual_size) or calls pytest.skip if pitch == width.
     """
+    discovery_fixture = cts_factory(
+        devices=[DeviceSpec(uuid=DEFAULT_TEST_UUID, mem_limit=1 * GiB, device_idx=0)]
+    )
 
-    def test_pitch_overhead_denied_when_over_limit(self, cts_factory):
-        """Discover the GPU's actual pitch, then set a limit between
-        width*height and pitch*height to trigger the alignment overhead denial."""
-
-        # Step 1: Discover the actual pitch for a narrow width.
-        # Use a raw (no-limiter) call to learn the pitch without enforcement.
-        # We use a very large limit so the discovery allocation succeeds.
-        discovery_fixture = cts_factory(
-            devices=[DeviceSpec(uuid=DEFAULT_TEST_UUID, mem_limit=1 * GiB, device_idx=0)]
-        )
-
-        width = 128  # Narrow width — GPU will likely pad to 256 or 512
-        height = 1024
-
-        discover_script = f"""\
+    discover_script = f"""\
 from hip_helper import HIPRuntime
 hip = HIPRuntime()
-ptr, pitch = hip.malloc_pitch({width}, {height})
+{alloc_call}
 print(f"PITCH={{pitch}}")
-print(f"WIDTH={width}")
-print(f"HEIGHT={height}")
-print(f"ESTIMATED={{pitch * {height}}}")
 hip.free(ptr)
 """
-        result = discovery_fixture.run_hip_test(discover_script)
-        assert result.succeeded, f"Discovery failed:\n{result.output}"
+    result = discovery_fixture.run_hip_test(discover_script)
+    assert result.succeeded, f"Discovery failed:\n{result.output}"
 
-        values = parse_kv_output(result.stdout)
-        pitch = values["PITCH"]
-        actual_size = pitch * height
-        estimated_size = width * height
+    values = parse_kv_output(result.stdout)
+    pitch = values["PITCH"]
 
-        if pitch == width:
-            pytest.skip(
-                f"GPU did not pad width={width} (pitch==width), "
-                f"cannot test alignment overhead path"
-            )
+    dims = [pitch, height] + ([depth] if depth else [])
+    actual_size = 1
+    for d in dims:
+        actual_size *= d
 
-        # Step 2: Set limit between width*height and pitch*height.
-        # width*height passes initial reserve, but pitch*height exceeds limit.
-        limit = estimated_size + (actual_size - estimated_size) // 2
-        assert estimated_size <= limit < actual_size, (
-            f"Limit {limit} not between estimated {estimated_size} and actual {actual_size}"
+    est_dims = [width, height] + ([depth] if depth else [])
+    estimated_size = 1
+    for d in est_dims:
+        estimated_size *= d
+
+    if pitch == width:
+        pytest.skip(
+            f"GPU did not pad width={width} (pitch==width), "
+            f"cannot test alignment overhead path"
         )
 
-        test_fixture = cts_factory(
-            devices=[DeviceSpec(uuid=DEFAULT_TEST_UUID, mem_limit=limit, device_idx=0)]
-        )
+    return pitch, estimated_size, actual_size
 
-        test_script = f"""\
+
+def _assert_overhead_denied(cts_factory, alloc_call, api_name, width, height, depth=None):
+    """Assert that alignment overhead pushes an allocation over the limit.
+
+    Discovers pitch, sets limit between estimated and actual, verifies OOM denial.
+    """
+    pitch, estimated_size, actual_size = _discover_pitch(
+        cts_factory, alloc_call, width, height, depth
+    )
+    limit = estimated_size + (actual_size - estimated_size) // 2
+    assert estimated_size <= limit < actual_size
+
+    test_fixture = cts_factory(
+        devices=[DeviceSpec(uuid=DEFAULT_TEST_UUID, mem_limit=limit, device_idx=0)]
+    )
+
+    test_script = f"""\
 from hip_helper import HIPRuntime, HIP_ERROR_OUT_OF_MEMORY, HIPError
 hip = HIPRuntime()
 try:
-    ptr, pitch = hip.malloc_pitch({width}, {height})
-    # If we get here, the limiter did not catch the overhead
+    {alloc_call}
     print(f"UNEXPECTED_OK pitch={{pitch}}")
     hip.free(ptr)
 except HIPError as exc:
@@ -425,66 +454,242 @@ except HIPError as exc:
     else:
         print(f"UNEXPECTED={{exc.error_code}}")
 """
-        result = test_fixture.run_hip_test(test_script)
-        assert result.succeeded, f"Subprocess failed:\n{result.output}"
-        assert "DENIED" in result.stdout, (
-            f"hipMallocPitch should be denied when pitch*height ({actual_size}) "
-            f"exceeds limit ({limit}) even though width*height ({estimated_size}) "
-            f"fits. Got:\n{result.stdout}"
-        )
+    result = test_fixture.run_hip_test(test_script)
+    assert result.succeeded, f"Subprocess failed:\n{result.output}"
+    assert "DENIED" in result.stdout, (
+        f"{api_name} should be denied when actual ({actual_size}) "
+        f"exceeds limit ({limit}) even though estimated ({estimated_size}) "
+        f"fits. Got:\n{result.stdout}"
+    )
 
-    def test_pitch_overhead_shm_unchanged_after_denial(self, cts_factory):
-        """After the alignment overhead denial, SHM pod_memory_used must be 0.
-        The limiter should fully roll back both the initial and overhead reservations."""
-        discovery_fixture = cts_factory(
-            devices=[DeviceSpec(uuid=DEFAULT_TEST_UUID, mem_limit=1 * GiB, device_idx=0)]
-        )
 
-        width = 128
-        height = 1024
+def _assert_overhead_shm_unchanged(cts_factory, alloc_call, api_name, width, height, depth=None):
+    """Assert that SHM pod_memory_used is 0 after alignment overhead denial."""
+    pitch, estimated_size, actual_size = _discover_pitch(
+        cts_factory, alloc_call, width, height, depth
+    )
+    limit = estimated_size + (actual_size - estimated_size) // 2
 
-        discover_script = f"""\
-from hip_helper import HIPRuntime
-hip = HIPRuntime()
-ptr, pitch = hip.malloc_pitch({width}, {height})
-print(f"PITCH={{pitch}}")
-hip.free(ptr)
-"""
-        result = discovery_fixture.run_hip_test(discover_script)
-        assert result.succeeded, f"Discovery failed:\n{result.output}"
+    test_fixture = cts_factory(
+        devices=[DeviceSpec(uuid=DEFAULT_TEST_UUID, mem_limit=limit, device_idx=0)]
+    )
 
-        values = parse_kv_output(result.stdout)
-        pitch = values["PITCH"]
-        actual_size = pitch * height
-        estimated_size = width * height
-
-        if pitch == width:
-            pytest.skip("GPU did not pad width, cannot test alignment overhead path")
-
-        limit = estimated_size + (actual_size - estimated_size) // 2
-
-        test_fixture = cts_factory(
-            devices=[DeviceSpec(uuid=DEFAULT_TEST_UUID, mem_limit=limit, device_idx=0)]
-        )
-
-        test_script = f"""\
+    test_script = f"""\
 from hip_helper import HIPRuntime, HIPError
 hip = HIPRuntime()
 try:
-    ptr, pitch = hip.malloc_pitch({width}, {height})
+    {alloc_call}
     hip.free(ptr)
 except HIPError:
     pass
 print("DONE")
 """
-        result = test_fixture.run_hip_test(test_script)
-        assert result.succeeded, f"Subprocess failed:\n{result.output}"
+    result = test_fixture.run_hip_test(test_script)
+    assert result.succeeded, f"Subprocess failed:\n{result.output}"
 
-        shm_used = test_fixture.read_pod_memory_used(device_idx=0)
-        assert shm_used == 0, (
-            f"SHM pod_memory_used ({shm_used}) should be 0 after pitch overhead "
-            f"denial — the initial reservation must be fully rolled back"
+    shm_used = test_fixture.read_pod_memory_used(device_idx=0)
+    assert shm_used == 0, (
+        f"SHM pod_memory_used ({shm_used}) should be 0 after {api_name} "
+        f"overhead denial — the reservation must be fully rolled back"
+    )
+
+
+# Pitched alloc calls used by discovery and denial helpers.
+# Each must set `ptr` and `pitch` variables in the subprocess script scope.
+_PITCH_ALLOC_2D = "ptr, pitch = hip.malloc_pitch({width}, {height})"
+_PITCH_ALLOC_3D = "ptr, pitch, xsize, ysize = hip.malloc_3d({width}, {height}, {depth})"
+
+
+class TestMallocPitchAlignmentOverhead:
+    """hipMallocPitch alignment overhead can push an allocation over the limit."""
+
+    WIDTH, HEIGHT = 128, 1024
+
+    def test_pitch_overhead_denied_when_over_limit(self, cts_factory):
+        _assert_overhead_denied(
+            cts_factory,
+            _PITCH_ALLOC_2D.format(width=self.WIDTH, height=self.HEIGHT),
+            "hipMallocPitch", self.WIDTH, self.HEIGHT,
         )
+
+    def test_pitch_overhead_shm_unchanged_after_denial(self, cts_factory):
+        _assert_overhead_shm_unchanged(
+            cts_factory,
+            _PITCH_ALLOC_2D.format(width=self.WIDTH, height=self.HEIGHT),
+            "hipMallocPitch", self.WIDTH, self.HEIGHT,
+        )
+
+
+class TestMalloc3DAccounting:
+    """hipMalloc3D accounting tracks pitch * height * depth (actual GPU consumption).
+
+    Like hipMallocPitch, hipMalloc3D returns a pitched pointer where pitch >= width
+    due to alignment. The limiter must account for pitch*height*depth, not
+    width*height*depth, to avoid under-reporting actual GPU memory usage.
+    """
+
+    def test_malloc_3d_basic(self, cts):
+        """hipMalloc3D with known dimensions should succeed and return valid pitched pointer."""
+        result = cts.run_hip_test("""\
+from hip_helper import HIPRuntime
+hip = HIPRuntime()
+
+ptr, pitch, xsize, ysize = hip.malloc_3d(1024, 1024, 1)
+print(f"PTR={ptr}")
+print(f"PITCH={pitch}")
+print(f"XSIZE={xsize}")
+print(f"YSIZE={ysize}")
+assert ptr != 0, "hipMalloc3D returned null ptr"
+assert pitch >= 1024, f"pitch {pitch} < width 1024"
+hip.free(ptr)
+print("ALLOC_OK")
+""")
+        assert result.succeeded, f"Subprocess failed:\n{result.output}"
+        assert "ALLOC_OK" in result.stdout, f"hipMalloc3D basic test failed:\n{result.stdout}"
+
+    def test_malloc_3d_tracks_pitch_times_height_times_depth(self, cts):
+        """Allocate with hipMalloc3D, verify pod_memory_used == pitch * height * depth."""
+        width = 1024
+        height = 512
+        depth = 2
+
+        script = f"""\
+import os
+from hip_helper import HIPRuntime, HIP_SUCCESS
+from shm_writer import read_pod_memory_used
+
+hip = HIPRuntime()
+shm_path = os.environ["TF_SHM_FILE"]
+
+used_before = read_pod_memory_used(shm_path, 0)
+
+ptr, pitch, xsize, ysize = hip.malloc_3d({width}, {height}, {depth})
+print(f"PITCH={{pitch}}")
+print(f"WIDTH={width}")
+print(f"HEIGHT={height}")
+print(f"DEPTH={depth}")
+print(f"PITCH_X_HEIGHT_X_DEPTH={{pitch * {height} * {depth}}}")
+
+used_after = read_pod_memory_used(shm_path, 0)
+delta = used_after - used_before
+print(f"SHM_DELTA={{delta}}")
+
+hip.free(ptr)
+print("DONE")
+"""
+        result = cts.run_hip_test(script)
+        assert result.succeeded, f"Subprocess failed:\n{result.output}"
+        assert "DONE" in result.stdout, f"Script did not complete:\n{result.stdout}"
+
+        values = parse_kv_output(result.stdout)
+        shm_delta = values["SHM_DELTA"]
+        pitch = values["PITCH"]
+        expected = pitch * height * depth
+
+        assert shm_delta == expected, (
+            f"SHM tracked {shm_delta} bytes but expected pitch*height*depth={expected}. "
+            f"pitch={pitch}, width={width}, height={height}, depth={depth}. "
+            f"The limiter should track pitch*height*depth (actual GPU consumption)."
+        )
+
+    def test_malloc_3d_multi_depth(self, cts):
+        """hipMalloc3D with depth > 1 should account for all depth slices."""
+        width = 256
+        height = 256
+        depth = 4
+
+        script = f"""\
+import os
+from hip_helper import HIPRuntime
+from shm_writer import read_pod_memory_used
+
+hip = HIPRuntime()
+shm_path = os.environ["TF_SHM_FILE"]
+
+used_before = read_pod_memory_used(shm_path, 0)
+
+ptr, pitch, xsize, ysize = hip.malloc_3d({width}, {height}, {depth})
+print(f"PITCH={{pitch}}")
+
+used_after = read_pod_memory_used(shm_path, 0)
+delta = used_after - used_before
+print(f"SHM_DELTA={{delta}}")
+print(f"EXPECTED={{pitch * {height} * {depth}}}")
+
+hip.free(ptr)
+print("DONE")
+"""
+        result = cts.run_hip_test(script)
+        assert result.succeeded, f"Subprocess failed:\n{result.output}"
+        assert "DONE" in result.stdout, f"Script did not complete:\n{result.stdout}"
+
+        values = parse_kv_output(result.stdout)
+        shm_delta = values["SHM_DELTA"]
+        expected = values["EXPECTED"]
+
+        assert shm_delta == expected, (
+            f"SHM tracked {shm_delta} bytes but expected {expected} "
+            f"(pitch * height * depth with depth={depth})."
+        )
+
+
+class TestMalloc3DAlignmentOverhead:
+    """hipMalloc3D alignment overhead can push an allocation over the limit."""
+
+    WIDTH, HEIGHT, DEPTH = 128, 1024, 2
+
+    def test_3d_overhead_denied_when_over_limit(self, cts_factory):
+        _assert_overhead_denied(
+            cts_factory,
+            _PITCH_ALLOC_3D.format(width=self.WIDTH, height=self.HEIGHT, depth=self.DEPTH),
+            "hipMalloc3D", self.WIDTH, self.HEIGHT, self.DEPTH,
+        )
+
+    def test_3d_overhead_shm_unchanged_after_denial(self, cts_factory):
+        _assert_overhead_shm_unchanged(
+            cts_factory,
+            _PITCH_ALLOC_3D.format(width=self.WIDTH, height=self.HEIGHT, depth=self.DEPTH),
+            "hipMalloc3D", self.WIDTH, self.HEIGHT, self.DEPTH,
+        )
+
+
+# Template for the common exception-based OOM pattern: fill near limit with
+# hipMalloc, then attempt the variant alloc and expect HIP_ERROR_OUT_OF_MEMORY.
+# Used by TestPerVariantOomEnforcement below.
+_OOM_TEMPLATE = """\
+from hip_helper import HIPRuntime, HIP_SUCCESS, HIP_ERROR_OUT_OF_MEMORY, HIPError
+hip = HIPRuntime()
+
+fill_size = {{fill_size}}
+err, fill_ptr = hip.malloc_raw(fill_size)
+assert err == HIP_SUCCESS, f"Fill alloc failed: {{{{err}}}}"
+
+{preamble}over_size = {{over_size}}
+try:
+    {alloc_expr}
+    print("UNEXPECTED=0")
+    {free_expr}
+except HIPError as exc:
+    if exc.error_code == HIP_ERROR_OUT_OF_MEMORY:
+        print("DENIED")
+    else:
+        print(f"UNEXPECTED={{{{exc.error_code}}}}")
+
+hip.free(fill_ptr)
+"""
+
+
+def _oom_script(alloc_expr, free_expr, preamble=""):
+    """Build an OOM test script from the template.
+
+    Two-stage format: this call resolves {alloc_expr}/{free_expr}/{preamble},
+    leaving {{fill_size}}/{{over_size}} as {fill_size}/{over_size} for the
+    test method's .format() call.
+    """
+    return _OOM_TEMPLATE.format(
+        alloc_expr=alloc_expr, free_expr=free_expr,
+        preamble=preamble + "\n" if preamble else "",
+    )
 
 
 class TestPerVariantOomEnforcement:
@@ -495,16 +700,15 @@ class TestPerVariantOomEnforcement:
     """
 
     VARIANT_SCRIPTS = {
+        # hipMalloc uses raw error codes (no exception), so it has a unique script.
         "hipMalloc": """\
 from hip_helper import HIPRuntime, HIP_SUCCESS, HIP_ERROR_OUT_OF_MEMORY
 hip = HIPRuntime()
 
-# Fill most of the limit with hipMalloc
 fill_size = {fill_size}
 err, fill_ptr = hip.malloc_raw(fill_size)
 assert err == HIP_SUCCESS, f"Fill alloc failed: {{err}}"
 
-# Now try to allocate more than remains — should be denied
 over_size = {over_size}
 err_over, _ = hip.malloc_raw(over_size)
 if err_over == HIP_ERROR_OUT_OF_MEMORY:
@@ -514,137 +718,34 @@ else:
 
 hip.free(fill_ptr)
 """,
-        "hipHostMalloc": """\
-from hip_helper import HIPRuntime, HIP_SUCCESS, HIP_ERROR_OUT_OF_MEMORY, HIPError
-hip = HIPRuntime()
-
-fill_size = {fill_size}
-err, fill_ptr = hip.malloc_raw(fill_size)
-assert err == HIP_SUCCESS, f"Fill alloc failed: {{err}}"
-
-over_size = {over_size}
-try:
-    ptr = hip.host_malloc(over_size, 0)
-    print("UNEXPECTED=0")
-    hip.host_free(ptr)
-except HIPError as exc:
-    if exc.error_code == HIP_ERROR_OUT_OF_MEMORY:
-        print("DENIED")
-    else:
-        print(f"UNEXPECTED={{exc.error_code}}")
-
-hip.free(fill_ptr)
-""",
-        "hipExtMallocWithFlags": """\
-from hip_helper import HIPRuntime, HIP_SUCCESS, HIP_ERROR_OUT_OF_MEMORY, HIPError
-hip = HIPRuntime()
-
-fill_size = {fill_size}
-err, fill_ptr = hip.malloc_raw(fill_size)
-assert err == HIP_SUCCESS, f"Fill alloc failed: {{err}}"
-
-over_size = {over_size}
-try:
-    ptr = hip.ext_malloc_with_flags(over_size, 0)
-    print("UNEXPECTED=0")
-    hip.free(ptr)
-except HIPError as exc:
-    if exc.error_code == HIP_ERROR_OUT_OF_MEMORY:
-        print("DENIED")
-    else:
-        print(f"UNEXPECTED={{exc.error_code}}")
-
-hip.free(fill_ptr)
-""",
-        "hipMallocManaged": """\
-from hip_helper import HIPRuntime, HIP_SUCCESS, HIP_ERROR_OUT_OF_MEMORY, HIPError
-hip = HIPRuntime()
-
-fill_size = {fill_size}
-err, fill_ptr = hip.malloc_raw(fill_size)
-assert err == HIP_SUCCESS, f"Fill alloc failed: {{err}}"
-
-over_size = {over_size}
-try:
-    ptr = hip.malloc_managed(over_size, 1)
-    print("UNEXPECTED=0")
-    hip.free(ptr)
-except HIPError as exc:
-    if exc.error_code == HIP_ERROR_OUT_OF_MEMORY:
-        print("DENIED")
-    else:
-        print(f"UNEXPECTED={{exc.error_code}}")
-
-hip.free(fill_ptr)
-""",
-        "hipMallocAsync": """\
-from hip_helper import HIPRuntime, HIP_SUCCESS, HIP_ERROR_OUT_OF_MEMORY, HIPError
-hip = HIPRuntime()
-
-fill_size = {fill_size}
-err, fill_ptr = hip.malloc_raw(fill_size)
-assert err == HIP_SUCCESS, f"Fill alloc failed: {{err}}"
-
-over_size = {over_size}
-try:
-    ptr = hip.malloc_async(over_size, 0)
-    print("UNEXPECTED=0")
-    hip.free_async(ptr, 0)
-    hip.device_synchronize()
-except HIPError as exc:
-    if exc.error_code == HIP_ERROR_OUT_OF_MEMORY:
-        print("DENIED")
-    else:
-        print(f"UNEXPECTED={{exc.error_code}}")
-
-hip.free(fill_ptr)
-""",
-        "hipMallocFromPoolAsync": """\
-from hip_helper import HIPRuntime, HIP_SUCCESS, HIP_ERROR_OUT_OF_MEMORY, HIPError
-hip = HIPRuntime()
-
-fill_size = {fill_size}
-err, fill_ptr = hip.malloc_raw(fill_size)
-assert err == HIP_SUCCESS, f"Fill alloc failed: {{err}}"
-
-pool = hip.get_default_mem_pool(0)
-over_size = {over_size}
-try:
-    ptr = hip.malloc_from_pool_async(over_size, pool, stream=0)
-    print("UNEXPECTED=0")
-    hip.free_async(ptr, 0)
-    hip.device_synchronize()
-except HIPError as exc:
-    if exc.error_code == HIP_ERROR_OUT_OF_MEMORY:
-        print("DENIED")
-    else:
-        print(f"UNEXPECTED={{exc.error_code}}")
-
-hip.free(fill_ptr)
-""",
-        "hipMallocPitch": """\
-from hip_helper import HIPRuntime, HIP_SUCCESS, HIP_ERROR_OUT_OF_MEMORY, HIPError
-hip = HIPRuntime()
-
-fill_size = {fill_size}
-err, fill_ptr = hip.malloc_raw(fill_size)
-assert err == HIP_SUCCESS, f"Fill alloc failed: {{err}}"
-
-# width * height = over_size, which when added to fill_size exceeds limit.
-# Use width=over_size, height=1 so the logical size is exactly over_size.
-over_size = {over_size}
-try:
-    ptr, pitch = hip.malloc_pitch(over_size, 1)
-    print("UNEXPECTED=0")
-    hip.free(ptr)
-except HIPError as exc:
-    if exc.error_code == HIP_ERROR_OUT_OF_MEMORY:
-        print("DENIED")
-    else:
-        print(f"UNEXPECTED={{exc.error_code}}")
-
-hip.free(fill_ptr)
-""",
+        # Standard exception-based variants — all share the same template.
+        "hipHostMalloc": _oom_script(
+            "ptr = hip.host_malloc(over_size, 0)", "hip.host_free(ptr)"),
+        "hipExtMallocWithFlags": _oom_script(
+            "ptr = hip.ext_malloc_with_flags(over_size, 0)", "hip.free(ptr)"),
+        "hipMallocManaged": _oom_script(
+            "ptr = hip.malloc_managed(over_size, 1)", "hip.free(ptr)"),
+        "hipHostAlloc": _oom_script(
+            "ptr = hip.host_alloc(over_size, 0)", "hip.host_free(ptr)"),
+        "hipMallocHost": _oom_script(
+            "ptr = hip.malloc_host(over_size)", "hip.host_free(ptr)"),
+        "hipMemAllocHost": _oom_script(
+            "ptr = hip.mem_alloc_host(over_size)", "hip.host_free(ptr)"),
+        # Async variants need device_synchronize for cleanup.
+        "hipMallocAsync": _oom_script(
+            "ptr = hip.malloc_async(over_size, 0)",
+            "hip.free_async(ptr, 0)\n    hip.device_synchronize()"),
+        "hipMallocFromPoolAsync": _oom_script(
+            "ptr = hip.malloc_from_pool_async(over_size, pool, stream=0)",
+            "hip.free_async(ptr, 0)\n    hip.device_synchronize()",
+            preamble="pool = hip.get_default_mem_pool(0)"),
+        # Pitched variants use width=over_size, height=1 [, depth=1] so logical
+        # size is exactly over_size. This tests the estimated-size denial path;
+        # alignment overhead denial is covered by TestMallocPitch/3DAlignmentOverhead.
+        "hipMallocPitch": _oom_script(
+            "ptr, pitch = hip.malloc_pitch(over_size, 1)", "hip.free(ptr)"),
+        "hipMalloc3D": _oom_script(
+            "ptr, pitch, xsize, ysize = hip.malloc_3d(over_size, 1, 1)", "hip.free(ptr)"),
     }
 
     @pytest.mark.parametrize("variant", list(VARIANT_SCRIPTS.keys()))

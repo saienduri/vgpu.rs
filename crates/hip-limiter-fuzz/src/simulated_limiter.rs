@@ -2,6 +2,10 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use dashmap::DashMap;
 
+/// Maximum single allocation size — rejects before fetch_add to prevent
+/// transient wrapping of the atomic counter.
+const MAX_ALLOC_SIZE: u64 = u64::MAX / 2;
+
 /// Pure-Rust model of the hip-limiter's memory accounting logic.
 ///
 /// This faithfully reproduces the semantics of `limiter.rs` and the `check_and_alloc!`
@@ -59,8 +63,6 @@ impl SimulatedLimiter {
             return Ok(pointer);
         }
 
-        // Guard against u64 overflow in fetch_add (matches real limiter's MAX_ALLOC_SIZE)
-        const MAX_ALLOC_SIZE: u64 = u64::MAX / 2;
         if size > MAX_ALLOC_SIZE {
             return Err(());
         }
@@ -130,6 +132,70 @@ impl SimulatedLimiter {
         self.allocation_tracker.len()
     }
 
+    /// Simulate a pitched allocation (hipMallocPitch / hipMalloc3D).
+    ///
+    /// Models the two-phase reserve pattern:
+    /// 1. Reserve `estimated_size` (width * height [* depth])
+    /// 2. "Native allocator" returns `actual_size` (pitch * height [* depth], where pitch >= width)
+    /// 3. If `actual_size > estimated_size`, try to reserve the extra overhead
+    ///    - If that pushes over limit: rollback everything, return Err
+    /// 4. Record allocation with `actual_size`
+    ///
+    /// `actual_size` must be >= `estimated_size` (pitch >= width invariant).
+    /// If `native_succeeds` is false, simulates native allocator failure after reservation.
+    pub fn try_alloc_pitched(
+        &self,
+        estimated_size: u64,
+        actual_size: u64,
+        native_succeeds: bool,
+    ) -> Result<usize, ()> {
+        debug_assert!(actual_size >= estimated_size, "pitch >= width invariant");
+
+        if estimated_size == 0 {
+            let pointer = self.next_pointer.fetch_add(1, Ordering::Relaxed);
+            return Ok(pointer);
+        }
+
+        if estimated_size > MAX_ALLOC_SIZE || actual_size > MAX_ALLOC_SIZE {
+            return Err(());
+        }
+
+        // Phase 1: Reserve estimated_size
+        let previous_used = self.pod_memory_used.fetch_add(estimated_size, Ordering::AcqRel);
+        let new_used = previous_used.saturating_add(estimated_size);
+
+        if new_used > self.mem_limit {
+            self.pod_memory_used.fetch_sub(estimated_size, Ordering::AcqRel);
+            return Err(());
+        }
+
+        // Phase 2: Native allocator
+        if !native_succeeds {
+            self.pod_memory_used.fetch_sub(estimated_size, Ordering::AcqRel);
+            return Err(());
+        }
+
+        // Phase 3: Reserve alignment overhead (extra = actual_size - estimated_size)
+        let extra = actual_size.saturating_sub(estimated_size);
+
+        if extra > 0 {
+            let prev = self.pod_memory_used.fetch_add(extra, Ordering::AcqRel);
+            let new_total = prev.saturating_add(extra);
+
+            if new_total > self.mem_limit {
+                // Extra overhead pushes over limit — rollback everything
+                self.pod_memory_used.fetch_sub(extra, Ordering::AcqRel);
+                self.pod_memory_used.fetch_sub(estimated_size, Ordering::AcqRel);
+                return Err(());
+            }
+        }
+
+        // Phase 4: Record with actual_size
+        let pointer = self.next_pointer.fetch_add(1, Ordering::Relaxed);
+        self.allocation_tracker.insert(pointer, actual_size);
+        Ok(pointer)
+    }
+
     /// Simulate an allocation where the native allocator fails after reservation.
     ///
     /// Models the check_and_alloc! path: try_reserve succeeds, but the native HIP call
@@ -143,7 +209,6 @@ impl SimulatedLimiter {
             return Ok(());
         }
 
-        const MAX_ALLOC_SIZE: u64 = u64::MAX / 2;
         if size > MAX_ALLOC_SIZE {
             return Err(());
         }

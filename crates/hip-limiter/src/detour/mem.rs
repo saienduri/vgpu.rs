@@ -11,6 +11,27 @@ use crate::limiter::Error;
 use crate::with_device;
 use crate::GLOBAL_LIMITER;
 
+/// hipPitchedPtr — FFI struct populated by hipMalloc3D.
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+pub struct HipPitchedPtr {
+    pub ptr: *mut c_void,
+    pub pitch: usize,
+    pub xsize: usize,
+    pub ysize: usize,
+}
+
+/// hipExtent — FFI struct for 3D extent dimensions.
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+pub struct HipExtent {
+    pub width: usize,
+    pub height: usize,
+    pub depth: usize,
+}
+
 /// Map a reserve error to a HIP error code.
 fn handle_reserve_error(error: Error, alloc_name: &str) -> HipError {
     match error {
@@ -73,10 +94,119 @@ macro_rules! check_and_alloc {
     }};
 }
 
+/// Free-then-record: call the native free FIRST, then update accounting.
+///
+/// This ordering is conservative: if the native free succeeds but the process crashes
+/// before record_free, pod_memory_used over-reports (safe — other pods see less
+/// available, not more). The alternative (record_free first) risks under-reporting
+/// if native free fails, which could allow overcommit.
+///
+/// $ptr: the *mut c_void pointer to free
+/// $free_fn: expression that calls the native free function, returning HipError
+macro_rules! check_and_free {
+    ($ptr:expr, $free_fn:expr) => {{
+        let result = $free_fn;
+        if result == HIP_SUCCESS && !$ptr.is_null() {
+            if let Some(limiter) = GLOBAL_LIMITER.get() {
+                limiter.record_free($ptr as usize);
+            }
+        }
+        result
+    }};
+}
+
+/// Two-phase pitched allocation: reserve estimated, call native, reserve alignment overhead.
+///
+/// Shared implementation for hipMallocPitch and hipMalloc3D. The GPU allocates
+/// `pitch * height [* depth]` bytes where `pitch >= width` due to alignment, but
+/// we only know `pitch` after the native call returns.
+///
+/// Flow:
+/// 1. Reserve `estimated_size` (width * height [* depth])
+/// 2. Call native allocator → get actual `pitch`
+/// 3. Compute `actual_size` from pitch via `$actual_size_fn`
+/// 4. If `actual_size > estimated_size`, reserve the extra overhead
+///    - If over limit: rollback everything, free native alloc via FN_HIP_FREE, return OOM
+///    - Uses FN_HIP_FREE (not the hooked detour) because the pointer was never
+///      record_allocation'd — the detour would try to record_free a non-existent entry.
+/// 5. Record allocation with `actual_size`
+///
+/// `$alloc_name`: string label for logging
+/// `$estimated_size`: pre-computed u64, already validated (non-zero, within MAX_ALLOC_SIZE)
+/// `$native_call`: expression that calls the native allocator, returning HipError
+/// `$out_ptr_expr`: expression yielding the allocated *mut c_void (e.g., `*ptr` or `(*pitched).ptr`)
+/// `$actual_size_fn`: closure `|pitch: usize| -> Option<usize>` computing actual size from pitch
+/// `$out_pitch_expr`: expression yielding the actual pitch (e.g., `*pitch` or `(*pitched).pitch`)
+macro_rules! check_and_alloc_pitched {
+    ($alloc_name:expr, $estimated_size:expr, $native_call:expr, $out_ptr_expr:expr, $out_pitch_expr:expr, $actual_size_fn:expr) => {{
+        match with_device!() {
+            Ok((limiter, device_idx)) => match limiter.try_reserve(device_idx, $estimated_size) {
+                Ok(_previous_used) => 'alloc: {
+                    let result = $native_call;
+
+                    if result != HIP_SUCCESS {
+                        limiter.rollback_reservation(device_idx, $estimated_size);
+                        break 'alloc result;
+                    }
+
+                    let allocated_ptr = $out_ptr_expr as usize;
+                    if allocated_ptr == 0 {
+                        limiter.rollback_reservation(device_idx, $estimated_size);
+                        break 'alloc result;
+                    }
+
+                    let actual_pitch = $out_pitch_expr;
+                    let actual_size = match ($actual_size_fn)(actual_pitch) {
+                        Some(size) => size as u64,
+                        None => {
+                            limiter.rollback_reservation(device_idx, $estimated_size);
+                            FN_HIP_FREE($out_ptr_expr);
+                            break 'alloc HIP_ERROR_OUT_OF_MEMORY;
+                        }
+                    };
+                    let extra = actual_size.saturating_sub($estimated_size);
+
+                    if extra > 0 && limiter.try_reserve(device_idx, extra).is_err() {
+                        tracing::warn!(
+                            "{}: pitch ({}) > width, actual size ({}) exceeds limit after alignment overhead — denying",
+                            $alloc_name, actual_pitch, actual_size
+                        );
+                        limiter.rollback_reservation(device_idx, $estimated_size);
+                        FN_HIP_FREE($out_ptr_expr);
+                        break 'alloc HIP_ERROR_OUT_OF_MEMORY;
+                    }
+
+                    limiter.record_allocation(device_idx, allocated_ptr, actual_size);
+                    result
+                }
+                Err(error) => handle_reserve_error(error, $alloc_name),
+            },
+            Err(error) => {
+                tracing::warn!("Device context error: {error}, falling back to native {}", $alloc_name);
+                $native_call
+            }
+        }
+    }};
+}
+
+/// Compute and validate the estimated size for a pitched allocation.
+///
+/// Multiplies all dimensions via checked arithmetic, then applies the MAX_ALLOC_SIZE
+/// guard (u64::MAX / 2) to prevent transient wrapping of the atomic counter.
+/// Returns `None` if any dimension overflows or the result exceeds the guard.
+fn checked_pitched_size(dims: &[usize]) -> Option<u64> {
+    let size = dims.iter().copied().try_fold(1usize, usize::checked_mul)?;
+    if size <= u64::MAX as usize / 2 {
+        Some(size as u64)
+    } else {
+        None
+    }
+}
+
 // --- Allocation hooks ---
 
 #[hook_fn]
-pub(crate) unsafe fn hip_malloc_detour(
+pub(crate) unsafe extern "C" fn hip_malloc_detour(
     ptr: *mut *mut c_void,
     size: usize,
 ) -> HipError {
@@ -87,7 +217,7 @@ pub(crate) unsafe fn hip_malloc_detour(
 }
 
 #[hook_fn]
-pub(crate) unsafe fn hip_ext_malloc_with_flags_detour(
+pub(crate) unsafe extern "C" fn hip_ext_malloc_with_flags_detour(
     ptr: *mut *mut c_void,
     size_bytes: usize,
     flags: c_uint,
@@ -99,7 +229,7 @@ pub(crate) unsafe fn hip_ext_malloc_with_flags_detour(
 }
 
 #[hook_fn]
-pub(crate) unsafe fn hip_host_malloc_detour(
+pub(crate) unsafe extern "C" fn hip_host_malloc_detour(
     ptr: *mut *mut c_void,
     size: usize,
     flags: c_uint,
@@ -111,7 +241,7 @@ pub(crate) unsafe fn hip_host_malloc_detour(
 }
 
 #[hook_fn]
-pub(crate) unsafe fn hip_malloc_managed_detour(
+pub(crate) unsafe extern "C" fn hip_malloc_managed_detour(
     dev_ptr: *mut *mut c_void,
     size: usize,
     flags: c_uint,
@@ -123,7 +253,7 @@ pub(crate) unsafe fn hip_malloc_managed_detour(
 }
 
 #[hook_fn]
-pub(crate) unsafe fn hip_malloc_async_detour(
+pub(crate) unsafe extern "C" fn hip_malloc_async_detour(
     dev_ptr: *mut *mut c_void,
     size: usize,
     stream: HipStream,
@@ -135,7 +265,7 @@ pub(crate) unsafe fn hip_malloc_async_detour(
 }
 
 #[hook_fn]
-pub(crate) unsafe fn hip_malloc_from_pool_async_detour(
+pub(crate) unsafe extern "C" fn hip_malloc_from_pool_async_detour(
     dev_ptr: *mut *mut c_void,
     size: usize,
     mem_pool: HipMemPool,
@@ -147,112 +277,113 @@ pub(crate) unsafe fn hip_malloc_from_pool_async_detour(
     })
 }
 
-/// hipMallocPitch uses a custom flow instead of check_and_alloc! because the GPU
-/// allocates `pitch * height` bytes (where `pitch >= width` due to alignment), but
-/// we only know `pitch` after the native call returns. The flow:
-///
-/// 1. Reserve `width * height` (the user-requested size)
-/// 2. Call native hipMallocPitch → get actual `pitch`
-/// 3. If `pitch > width`, reserve the extra `(pitch - width) * height`
-///    - If that pushes over limit: rollback everything, free native alloc, return OOM
-/// 4. Record allocation with actual size `pitch * height`
 #[hook_fn]
-pub(crate) unsafe fn hip_malloc_pitch_detour(
+pub(crate) unsafe extern "C" fn hip_host_alloc_detour(
+    ptr: *mut *mut c_void,
+    size: usize,
+    flags: c_uint,
+) -> HipError {
+    let request_size = size as u64;
+    check_and_alloc!(ptr, request_size, "hipHostAlloc", || {
+        FN_HIP_HOST_ALLOC(ptr, size, flags)
+    })
+}
+
+#[hook_fn]
+pub(crate) unsafe extern "C" fn hip_malloc_host_detour(
+    ptr: *mut *mut c_void,
+    size: usize,
+) -> HipError {
+    let request_size = size as u64;
+    check_and_alloc!(ptr, request_size, "hipMallocHost", || {
+        FN_HIP_MALLOC_HOST(ptr, size)
+    })
+}
+
+#[hook_fn]
+pub(crate) unsafe extern "C" fn hip_mem_alloc_host_detour(
+    ptr: *mut *mut c_void,
+    size: usize,
+) -> HipError {
+    let request_size = size as u64;
+    check_and_alloc!(ptr, request_size, "hipMemAllocHost", || {
+        FN_HIP_MEM_ALLOC_HOST(ptr, size)
+    })
+}
+
+// --- Pitched allocation hooks ---
+//
+// hipMallocPitch and hipMalloc3D use a two-phase reserve pattern via check_and_alloc_pitched!
+// because the actual GPU allocation size depends on pitch alignment (pitch >= width), which
+// is only known after the native call returns.
+
+#[hook_fn]
+pub(crate) unsafe extern "C" fn hip_malloc_pitch_detour(
     ptr: *mut *mut c_void,
     pitch: *mut usize,
     width: usize,
     height: usize,
 ) -> HipError {
-    let estimated_size = match width.checked_mul(height) {
-        Some(size) => size as u64,
-        None => return HIP_ERROR_OUT_OF_MEMORY,
+    let Some(estimated_size) = checked_pitched_size(&[width, height]) else {
+        return HIP_ERROR_OUT_OF_MEMORY;
     };
 
-    match with_device!() {
-        Ok((limiter, device_idx)) => match limiter.try_reserve(device_idx, estimated_size) {
-            Ok(_previous_used) => {
-                // Step 2: Call native allocator
-                let result = FN_HIP_MALLOC_PITCH(ptr, pitch, width, height);
-
-                if result != HIP_SUCCESS || estimated_size == 0 {
-                    if estimated_size > 0 {
-                        limiter.rollback_reservation(device_idx, estimated_size);
-                    }
-                    return result;
-                }
-
-                let allocated_ptr = *ptr as usize;
-                if allocated_ptr == 0 {
-                    limiter.rollback_reservation(device_idx, estimated_size);
-                    return result;
-                }
-
-                // Step 3: Check actual pitch and reserve the alignment overhead
-                let actual_pitch = *pitch;
-                let actual_size = match actual_pitch.checked_mul(height) {
-                    Some(size) => size as u64,
-                    None => {
-                        // Overflow — roll back and free
-                        limiter.rollback_reservation(device_idx, estimated_size);
-                        FN_HIP_FREE(*ptr);
-                        return HIP_ERROR_OUT_OF_MEMORY;
-                    }
-                };
-                let extra = actual_size.saturating_sub(estimated_size);
-
-                if extra > 0 {
-                    if let Err(_) = limiter.try_reserve(device_idx, extra) {
-                        // Actual size exceeds limit — roll back everything and free
-                        tracing::warn!(
-                            "hipMallocPitch: pitch ({}) > width ({}), actual size ({}) exceeds limit after alignment overhead — denying",
-                            actual_pitch, width, actual_size
-                        );
-                        limiter.rollback_reservation(device_idx, estimated_size);
-                        FN_HIP_FREE(*ptr);
-                        return HIP_ERROR_OUT_OF_MEMORY;
-                    }
-                }
-
-                // Step 4: Record with actual size (pitch * height)
-                limiter.record_allocation(device_idx, allocated_ptr, actual_size);
-                result
-            }
-            Err(error) => handle_reserve_error(error, "hipMallocPitch"),
-        },
-        Err(error) => {
-            tracing::warn!("Device context error: {error}, falling back to native hipMallocPitch");
-            FN_HIP_MALLOC_PITCH(ptr, pitch, width, height)
-        }
+    if estimated_size == 0 {
+        return FN_HIP_MALLOC_PITCH(ptr, pitch, width, height);
     }
+
+    check_and_alloc_pitched!(
+        "hipMallocPitch",
+        estimated_size,
+        FN_HIP_MALLOC_PITCH(ptr, pitch, width, height),
+        *ptr,
+        *pitch,
+        |actual_pitch: usize| actual_pitch.checked_mul(height)
+    )
+}
+
+#[hook_fn]
+pub(crate) unsafe extern "C" fn hip_malloc_3d_detour(
+    pitched_dev_ptr: *mut HipPitchedPtr,
+    extent: HipExtent,
+) -> HipError {
+    let width = extent.width;
+    let height = extent.height;
+    let depth = extent.depth;
+
+    let Some(estimated_size) = checked_pitched_size(&[width, height, depth]) else {
+        return HIP_ERROR_OUT_OF_MEMORY;
+    };
+
+    if estimated_size == 0 {
+        return FN_HIP_MALLOC_3D(pitched_dev_ptr, extent);
+    }
+
+    check_and_alloc_pitched!(
+        "hipMalloc3D",
+        estimated_size,
+        FN_HIP_MALLOC_3D(pitched_dev_ptr, extent),
+        (*pitched_dev_ptr).ptr,
+        (*pitched_dev_ptr).pitch,
+        |actual_pitch: usize| actual_pitch.checked_mul(height).and_then(|ph| ph.checked_mul(depth))
+    )
 }
 
 // --- Free hooks ---
 
-// Free hooks call the native free FIRST, then update accounting. This ordering is
-// conservative: if the native free succeeds but the process crashes before record_free,
-// pod_memory_used over-reports (safe — other pods see less available, not more). The
-// alternative (record_free first) risks under-reporting if native free fails, which
-// could allow overcommit.
 #[hook_fn]
-pub(crate) unsafe fn hip_free_detour(ptr: *mut c_void) -> HipError {
-    let result = FN_HIP_FREE(ptr);
-    if result == HIP_SUCCESS && !ptr.is_null() {
-        if let Some(limiter) = GLOBAL_LIMITER.get() {
-            limiter.record_free(ptr as usize);
-        }
-    }
-    result
+pub(crate) unsafe extern "C" fn hip_free_detour(ptr: *mut c_void) -> HipError {
+    check_and_free!(ptr, FN_HIP_FREE(ptr))
 }
 
 #[hook_fn]
-pub(crate) unsafe fn hip_host_free_detour(ptr: *mut c_void) -> HipError {
-    let result = FN_HIP_HOST_FREE(ptr);
-    if result == HIP_SUCCESS && !ptr.is_null() {
-        if let Some(limiter) = GLOBAL_LIMITER.get() {
-            limiter.record_free(ptr as usize);
-        }
-    }
-    result
+pub(crate) unsafe extern "C" fn hip_host_free_detour(ptr: *mut c_void) -> HipError {
+    check_and_free!(ptr, FN_HIP_HOST_FREE(ptr))
+}
+
+#[hook_fn]
+pub(crate) unsafe extern "C" fn hip_free_host_detour(ptr: *mut c_void) -> HipError {
+    check_and_free!(ptr, FN_HIP_FREE_HOST(ptr))
 }
 
 // NOTE: hipFreeAsync defers the actual GPU memory release until stream completion,
@@ -261,23 +392,17 @@ pub(crate) unsafe fn hip_host_free_detour(ptr: *mut c_void) -> HipError {
 // If a subsequent hipMalloc fails because the GPU hasn't actually freed yet, the
 // check_and_alloc! macro handles it correctly (rolls back the reservation).
 #[hook_fn]
-pub(crate) unsafe fn hip_free_async_detour(
+pub(crate) unsafe extern "C" fn hip_free_async_detour(
     ptr: *mut c_void,
     stream: HipStream,
 ) -> HipError {
-    let result = FN_HIP_FREE_ASYNC(ptr, stream);
-    if result == HIP_SUCCESS && !ptr.is_null() {
-        if let Some(limiter) = GLOBAL_LIMITER.get() {
-            limiter.record_free(ptr as usize);
-        }
-    }
-    result
+    check_and_free!(ptr, FN_HIP_FREE_ASYNC(ptr, stream))
 }
 
 // --- Info spoofing hooks ---
 
 #[hook_fn]
-pub(crate) unsafe fn hip_mem_get_info_detour(
+pub(crate) unsafe extern "C" fn hip_mem_get_info_detour(
     free: *mut usize,
     total: *mut usize,
 ) -> HipError {
@@ -301,7 +426,7 @@ pub(crate) unsafe fn hip_mem_get_info_detour(
 }
 
 #[hook_fn]
-pub(crate) unsafe fn hip_device_total_mem_detour(
+pub(crate) unsafe extern "C" fn hip_device_total_mem_detour(
     bytes: *mut usize,
     device: HipDevice,
 ) -> HipError {
@@ -359,6 +484,30 @@ pub(crate) unsafe fn enable_hooks(hook_manager: &mut HookManager) -> Result<(), 
     replace_symbol!(
         hook_manager,
         Some("libamdhip64."),
+        "hipHostAlloc",
+        hip_host_alloc_detour,
+        FnHip_host_alloc,
+        FN_HIP_HOST_ALLOC
+    )?;
+    replace_symbol!(
+        hook_manager,
+        Some("libamdhip64."),
+        "hipMallocHost",
+        hip_malloc_host_detour,
+        FnHip_malloc_host,
+        FN_HIP_MALLOC_HOST
+    )?;
+    replace_symbol!(
+        hook_manager,
+        Some("libamdhip64."),
+        "hipMemAllocHost",
+        hip_mem_alloc_host_detour,
+        FnHip_mem_alloc_host,
+        FN_HIP_MEM_ALLOC_HOST
+    )?;
+    replace_symbol!(
+        hook_manager,
+        Some("libamdhip64."),
         "hipMallocManaged",
         hip_malloc_managed_detour,
         FnHip_malloc_managed,
@@ -380,14 +529,11 @@ pub(crate) unsafe fn enable_hooks(hook_manager: &mut HookManager) -> Result<(), 
         FnHip_malloc_from_pool_async,
         FN_HIP_MALLOC_FROM_POOL_ASYNC
     )?;
-    replace_symbol!(
-        hook_manager,
-        Some("libamdhip64."),
-        "hipMallocPitch",
-        hip_malloc_pitch_detour,
-        FnHip_malloc_pitch,
-        FN_HIP_MALLOC_PITCH
-    )?;
+    // Free hooks must be registered before pitched alloc hooks (hipMallocPitch,
+    // hipMalloc3D) because check_and_alloc_pitched! calls FN_HIP_FREE on the
+    // rollback path. Registration order doesn't affect runtime correctness (all
+    // hooks are installed before any are invoked), but keeping this order makes
+    // the dependency explicit for future maintainers.
     replace_symbol!(
         hook_manager,
         Some("libamdhip64."),
@@ -407,10 +553,34 @@ pub(crate) unsafe fn enable_hooks(hook_manager: &mut HookManager) -> Result<(), 
     replace_symbol!(
         hook_manager,
         Some("libamdhip64."),
+        "hipFreeHost",
+        hip_free_host_detour,
+        FnHip_free_host,
+        FN_HIP_FREE_HOST
+    )?;
+    replace_symbol!(
+        hook_manager,
+        Some("libamdhip64."),
         "hipFreeAsync",
         hip_free_async_detour,
         FnHip_free_async,
         FN_HIP_FREE_ASYNC
+    )?;
+    replace_symbol!(
+        hook_manager,
+        Some("libamdhip64."),
+        "hipMallocPitch",
+        hip_malloc_pitch_detour,
+        FnHip_malloc_pitch,
+        FN_HIP_MALLOC_PITCH
+    )?;
+    replace_symbol!(
+        hook_manager,
+        Some("libamdhip64."),
+        "hipMalloc3D",
+        hip_malloc_3d_detour,
+        FnHip_malloc_3d,
+        FN_HIP_MALLOC_3D
     )?;
     replace_symbol!(
         hook_manager,

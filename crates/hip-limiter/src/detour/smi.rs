@@ -29,7 +29,7 @@ fn resolve_rsmi_device(dv_ind: c_uint) -> Option<usize> {
 /// Hook for rsmi_dev_memory_total_get — spoofs VRAM total to mem_limit.
 /// Used by `rocm-smi --showmeminfo vram` and programmatic queries.
 #[hook_fn]
-pub(crate) unsafe fn rsmi_dev_memory_total_get_detour(
+pub(crate) unsafe extern "C" fn rsmi_dev_memory_total_get_detour(
     dv_ind: c_uint,
     mem_type: RsmiMemoryType,
     total: *mut u64,
@@ -191,7 +191,7 @@ fn resolve_amdsmi_device(handle: AmdSmiProcessorHandle) -> Option<usize> {
 /// Hook for amdsmi_get_gpu_memory_total — spoofs VRAM total to mem_limit.
 /// Used by `amd-smi monitor` and programmatic queries.
 #[hook_fn]
-pub(crate) unsafe fn amdsmi_get_gpu_memory_total_detour(
+pub(crate) unsafe extern "C" fn amdsmi_get_gpu_memory_total_detour(
     handle: AmdSmiProcessorHandle,
     mem_type: AmdSmiMemoryType,
     total: *mut u64,
@@ -221,7 +221,7 @@ pub(crate) unsafe fn amdsmi_get_gpu_memory_total_detour(
 /// Hook for amdsmi_get_gpu_vram_info — spoofs vram_size to mem_limit in MB.
 /// Used by `amd-smi static --vram`.
 #[hook_fn]
-pub(crate) unsafe fn amdsmi_get_gpu_vram_info_detour(
+pub(crate) unsafe extern "C" fn amdsmi_get_gpu_vram_info_detour(
     handle: AmdSmiProcessorHandle,
     info: *mut AmdSmiVramInfo,
 ) -> AmdSmiStatus {

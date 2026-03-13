@@ -92,6 +92,146 @@ proptest! {
     }
 }
 
+// --- Pitched allocation proptest (hipMallocPitch / hipMalloc3D two-phase pattern) ---
+
+#[derive(Debug, Clone)]
+enum PitchedOperation {
+    /// (estimated_size, overhead_pct): actual = estimated + estimated * overhead_pct / 100
+    PitchedAlloc(u64, u8),
+    /// Plain alloc (to interleave with pitched)
+    PlainAlloc(u64),
+    /// Free by index into live_pointers
+    Free(usize),
+}
+
+fn pitched_operation_strategy() -> impl Strategy<Value = PitchedOperation> {
+    prop_oneof![
+        // Pitched: estimated 1-500KB, overhead 0-50% (models pitch alignment)
+        (1u64..500_000, 0u8..50).prop_map(|(est, pct)| PitchedOperation::PitchedAlloc(est, pct)),
+        // Plain alloc
+        (1u64..500_000).prop_map(PitchedOperation::PlainAlloc),
+        // Free
+        (0usize..500).prop_map(PitchedOperation::Free),
+    ]
+}
+
+proptest! {
+    /// Random mix of pitched and plain alloc/free operations.
+    /// pod_memory_used must always equal the sum of live allocation sizes,
+    /// and pitched allocations must be tracked at their actual size (not estimated).
+    #[test]
+    fn pitched_alloc_accounting(operations in proptest::collection::vec(pitched_operation_strategy(), 1..500)) {
+        let limiter = SimulatedLimiter::new(10_000_000);
+        let mut live_pointers: Vec<usize> = Vec::new();
+
+        for operation in &operations {
+            match operation {
+                PitchedOperation::PitchedAlloc(estimated, overhead_pct) => {
+                    let extra = *estimated * (*overhead_pct as u64) / 100;
+                    let actual = *estimated + extra;
+                    if let Ok(pointer) = limiter.try_alloc_pitched(*estimated, actual, true) {
+                        live_pointers.push(pointer);
+                    }
+                }
+                PitchedOperation::PlainAlloc(size) => {
+                    if let Ok(pointer) = limiter.try_alloc(*size) {
+                        if *size > 0 {
+                            live_pointers.push(pointer);
+                        }
+                    }
+                }
+                PitchedOperation::Free(index) => {
+                    if !live_pointers.is_empty() {
+                        let idx = *index % live_pointers.len();
+                        let pointer = live_pointers.swap_remove(idx);
+                        limiter.free(pointer);
+                    }
+                }
+            }
+        }
+
+        prop_assert_eq!(
+            limiter.allocation_count(),
+            live_pointers.len(),
+            "allocation_count must match live pointers"
+        );
+        prop_assert_eq!(
+            limiter.pod_memory_used(),
+            limiter.tracked_total(),
+            "pod_memory_used must equal tracked_total"
+        );
+    }
+
+    /// Pitched allocations must never push pod_memory_used above the limit,
+    /// even with interleaved frees returning capacity to the pool.
+    #[test]
+    fn pitched_never_exceeds_limit(
+        operations in proptest::collection::vec(pitched_operation_strategy(), 1..200)
+    ) {
+        let limit = 2_000_000u64;
+        let limiter = SimulatedLimiter::new(limit);
+        let mut live_pointers: Vec<usize> = Vec::new();
+
+        for operation in &operations {
+            match operation {
+                PitchedOperation::PitchedAlloc(estimated, overhead_pct) => {
+                    let extra = *estimated * (*overhead_pct as u64) / 100;
+                    let actual = *estimated + extra;
+                    if let Ok(pointer) = limiter.try_alloc_pitched(*estimated, actual, true) {
+                        live_pointers.push(pointer);
+                    }
+                }
+                PitchedOperation::PlainAlloc(size) => {
+                    if let Ok(pointer) = limiter.try_alloc(*size) {
+                        if *size > 0 {
+                            live_pointers.push(pointer);
+                        }
+                    }
+                }
+                PitchedOperation::Free(index) => {
+                    if !live_pointers.is_empty() {
+                        let idx = *index % live_pointers.len();
+                        let pointer = live_pointers.swap_remove(idx);
+                        limiter.free(pointer);
+                    }
+                }
+            }
+            prop_assert!(
+                limiter.pod_memory_used() <= limit,
+                "pod_memory_used ({}) exceeded limit ({})",
+                limiter.pod_memory_used(),
+                limit
+            );
+        }
+    }
+
+    /// Pitched alloc then free: all memory must be reclaimed at actual_size,
+    /// not estimated_size. Exercises that the tracker stores the right value.
+    #[test]
+    fn pitched_free_returns_to_zero(
+        entries in proptest::collection::vec((1u64..500_000, 0u8..50), 1..50)
+    ) {
+        let limiter = SimulatedLimiter::new(u64::MAX / 2);
+        let mut pointers = Vec::new();
+
+        for (estimated, overhead_pct) in &entries {
+            let extra = *estimated * (*overhead_pct as u64) / 100;
+            let actual = *estimated + extra;
+            if let Ok(pointer) = limiter.try_alloc_pitched(*estimated, actual, true) {
+                pointers.push(pointer);
+            }
+        }
+
+        for pointer in pointers {
+            limiter.free(pointer);
+        }
+
+        prop_assert_eq!(limiter.pod_memory_used(), 0);
+        prop_assert_eq!(limiter.tracked_total(), 0);
+        prop_assert_eq!(limiter.allocation_count(), 0);
+    }
+}
+
 // --- Multi-device proptest ---
 
 #[derive(Debug, Clone)]
