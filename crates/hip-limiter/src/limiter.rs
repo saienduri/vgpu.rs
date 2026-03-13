@@ -18,8 +18,8 @@ pub(crate) enum Error {
     #[error("Shared memory access failed: {0}")]
     SharedMemory(#[from] anyhow::Error),
 
-    #[error("Device {0} not configured")]
-    DeviceNotConfigured(usize),
+    #[error("Device not configured: {0}")]
+    DeviceNotConfigured(String),
 
     #[error("Allocation exceeds limit on device {device_idx}: used ({used}) + request ({request}) > limit ({limit})")]
     OverLimit {
@@ -178,7 +178,7 @@ impl Limiter {
             }
         }
 
-        Err(Error::DeviceNotConfigured(hip_device as usize))
+        Err(Error::DeviceNotConfigured(format!("HIP device {hip_device}")))
     }
 
     pub(crate) fn get_pod_memory_usage(
@@ -207,7 +207,7 @@ impl Limiter {
         ) {
             Ok((used, limit))
         } else {
-            Err(Error::DeviceNotConfigured(raw_device_index))
+            Err(Error::DeviceNotConfigured(format!("SHM device {raw_device_index}")))
         }
     }
 
@@ -271,7 +271,7 @@ impl Limiter {
         );
 
         let Some((previous_used, mem_limit)) = reserve_result else {
-            return Err(Error::DeviceNotConfigured(device_idx));
+            return Err(Error::DeviceNotConfigured(format!("SHM device {device_idx}")));
         };
 
         let new_used = previous_used.saturating_add(size);
@@ -358,6 +358,18 @@ impl Limiter {
 
     pub(crate) fn isolation(&self) -> Option<&str> {
         self.isolation.as_deref()
+    }
+
+    /// Match a PCI BDF string (e.g., "0000:75:00.0") against configured devices.
+    /// Used by amdsmi hooks to resolve opaque processor handles to SHM device indices.
+    pub(crate) fn device_index_by_pci_bdf(&self, bdf: &str) -> Result<usize, Error> {
+        let bdf_lower = bdf.to_lowercase();
+        for (idx, uuid) in &self.gpu_idx_uuids {
+            if normalize_uuid_to_bdf(uuid) == bdf_lower {
+                return Ok(*idx);
+            }
+        }
+        Err(Error::DeviceNotConfigured(format!("BDF {bdf}")))
     }
 
     pub(crate) fn all_devices_unlimited(&self) -> bool {
@@ -625,5 +637,71 @@ mod tests {
         assert_eq!(result[0].0, 1); // device 1
         assert_eq!(result[1].0, 6); // device 6
         assert_eq!(result[2].0, 7); // device 7
+    }
+
+    #[test]
+    fn test_resolve_device_indices_bdf_match() {
+        let result = super::resolve_device_indices(
+            &uuids(&["amd-gpu-0000:75:00.0", "amd-gpu-0000:f5:00.0"]),
+            &mi325x_devices(),
+        );
+        assert_eq!(result.len(), 2);
+
+        let bdf = "0000:75:00.0";
+        let bdf_lower = bdf.to_lowercase();
+        let found = result.iter().find(|(_, uuid)| {
+            super::normalize_uuid_to_bdf(uuid) == bdf_lower
+        });
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().0, 0);
+    }
+
+    #[test]
+    fn test_resolve_device_indices_bdf_no_match() {
+        let result = super::resolve_device_indices(
+            &uuids(&["amd-gpu-0000:75:00.0"]),
+            &mi325x_devices(),
+        );
+        let bdf = "0000:aa:00.0";
+        let bdf_lower = bdf.to_lowercase();
+        let found = result.iter().find(|(_, uuid)| {
+            super::normalize_uuid_to_bdf(uuid) == bdf_lower
+        });
+        assert!(found.is_none());
+    }
+
+    // --- BDF formatting tests (amdsmi bitfield → PCI bus ID string) ---
+    //
+    // amdsmi_bdf_t layout: function(3) | device(5) | bus(8) | domain(48)
+    // Verified against MI325X empirical data.
+
+    #[test]
+    fn test_format_amdsmi_bdf_mi325x_device() {
+        // MI325X GPU at 0000:75:00.0 → raw = 0x7500
+        use crate::detour::smi::format_amdsmi_bdf;
+        assert_eq!(format_amdsmi_bdf(0x0000000000007500), "0000:75:00.0");
+    }
+
+    #[test]
+    fn test_format_amdsmi_bdf_high_bus() {
+        // MI325X GPU at 0000:f5:00.0 → raw = 0xf500
+        use crate::detour::smi::format_amdsmi_bdf;
+        assert_eq!(format_amdsmi_bdf(0x000000000000f500), "0000:f5:00.0");
+    }
+
+    #[test]
+    fn test_format_amdsmi_bdf_with_function() {
+        // Device with function number 3: 0000:05:01.3
+        use crate::detour::smi::format_amdsmi_bdf;
+        let raw: u64 = 3 | (1 << 3) | (0x05 << 8);
+        assert_eq!(format_amdsmi_bdf(raw), "0000:05:01.3");
+    }
+
+    #[test]
+    fn test_format_amdsmi_bdf_nonzero_domain() {
+        // Multi-domain system: 0001:75:00.0
+        use crate::detour::smi::format_amdsmi_bdf;
+        let raw: u64 = (0x75 << 8) | (1u64 << 16);
+        assert_eq!(format_amdsmi_bdf(raw), "0001:75:00.0");
     }
 }

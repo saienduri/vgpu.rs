@@ -1,4 +1,5 @@
 pub(crate) mod mem;
+pub(crate) mod smi;
 
 /// Get the current HIP device, resolve the limiter and device index.
 /// Returns Result<(&Limiter, usize), Error>.

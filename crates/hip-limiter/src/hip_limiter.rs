@@ -16,7 +16,7 @@ use utils::logging;
 use utils::replace_symbol;
 
 mod config;
-mod detour;
+pub(crate) mod detour;
 mod hiplib;
 mod limiter;
 
@@ -170,7 +170,8 @@ fn try_install_hip_hooks() {
 
         let install_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
             let mut hook_manager = HookManager::default();
-            detour::mem::enable_hooks(&mut hook_manager)
+            detour::mem::enable_hooks(&mut hook_manager)?;
+            Ok::<(), utils::HookError>(())
         }));
 
         match install_result {
@@ -224,7 +225,7 @@ fn init_hooks() {
         return;
     }
 
-    // Try to install hooks immediately if libamdhip64 is already loaded
+    // Try to install hooks immediately if libraries are already loaded
     if utils::hooks::is_module_loaded("libamdhip64.") {
         try_install_hip_hooks();
     }
@@ -269,7 +270,10 @@ unsafe extern "C" fn dlsym_detour(handle: *const c_void, symbol: *const c_char) 
         return call_original_dlsym(handle, symbol);
     };
 
-    if !symbol_str.starts_with("hip") {
+    let is_hip_symbol = symbol_str.starts_with("hip");
+    let is_smi_symbol = symbol_str.starts_with("rsmi_") || symbol_str.starts_with("amdsmi_");
+
+    if !is_hip_symbol && !is_smi_symbol {
         return call_original_dlsym(handle, symbol);
     }
 
@@ -288,34 +292,21 @@ unsafe extern "C" fn dlsym_detour(handle: *const c_void, symbol: *const c_char) 
     }
     let _guard = ResetGuard;
 
-    if !HOOKS_INITIALIZED.load(Ordering::Acquire) {
+    if is_hip_symbol && !HOOKS_INITIALIZED.load(Ordering::Acquire) {
         tracing::debug!("dlsym observed HIP symbol {symbol_str}, ensuring hooks installed");
         try_install_hip_hooks();
     }
 
-    call_original_dlsym(handle, symbol)
+    // For SMI symbols, intercept at the dlsym level: resolve the original
+    // address and return our detour's address. This avoids Frida reentrancy
+    // issues when installing hooks from within the dlsym detour.
+    let original = call_original_dlsym(handle, symbol);
+    if is_smi_symbol && !original.is_null() {
+        if let Some(detour) = detour::smi::try_intercept_smi_symbol(symbol_str, original) {
+            return detour;
+        }
+    }
+
+    original
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn test_isolation_soft_should_not_skip() {
-        let isolation = Some("soft");
-        let should_skip = isolation.is_some_and(|iso| iso != "soft");
-        assert!(!should_skip);
-    }
-
-    #[test]
-    fn test_isolation_hard_should_skip() {
-        let isolation = Some("hard");
-        let should_skip = isolation.is_some_and(|iso| iso != "soft");
-        assert!(should_skip);
-    }
-
-    #[test]
-    fn test_isolation_none_should_not_skip() {
-        let isolation: Option<&str> = None;
-        let should_skip = isolation.is_some_and(|iso| iso != "soft");
-        assert!(!should_skip);
-    }
-}
