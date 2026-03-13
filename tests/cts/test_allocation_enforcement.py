@@ -233,6 +233,13 @@ ptr, pitch = hip.malloc_pitch(1024, 1024)
 print("ALLOC_OK")
 hip.free(ptr)
 """,
+    "hipMemAllocPitch": """\
+from hip_helper import HIPRuntime
+hip = HIPRuntime()
+ptr, pitch = hip.mem_alloc_pitch(1024, 1024)
+print("ALLOC_OK")
+hip.free(ptr)
+""",
     "hipMalloc3D": """\
 from hip_helper import HIPRuntime
 hip = HIPRuntime()
@@ -254,45 +261,6 @@ def test_each_alloc_variant(cts, variant):
     assert result.succeeded, f"Subprocess failed for {variant}: {result.stderr}"
     assert "ALLOC_OK" in result.stdout, f"{variant} allocation failed: {result.stdout}"
 
-
-def test_malloc_pitch(cts):
-    """hipMallocPitch accounts for width*height bytes in the limiter.
-
-    The Rust hook computes request_size = width * height before the limit check.
-    """
-    result = cts.run_hip_test("""
-        from hip_helper import HIPRuntime, HIP_SUCCESS, HIP_ERROR_OUT_OF_MEMORY
-
-        hip = HIPRuntime()
-        limit = 1024 * 1024 * 1024  # 1 GiB
-
-        # Allocate a pitched region within limits
-        width = 1024
-        height = 1024  # 1 MiB logical size
-        ptr, pitch = hip.malloc_pitch(width, height)
-        print(f"pitch={pitch}")
-        print(f"ptr={ptr}")
-        assert ptr != 0, "malloc_pitch returned null ptr"
-        assert pitch >= width, f"pitch {pitch} < width {width}"
-        hip.free(ptr)
-
-        # Now try a pitched allocation that exceeds the limit
-        # width * height > 1 GiB
-        big_width = 1024 * 1024  # 1 MiB
-        big_height = 1025  # total = 1 MiB * 1025 > 1 GiB
-        try:
-            ptr2, pitch2 = hip.malloc_pitch(big_width, big_height)
-            # If it didn't raise, it means the native call succeeded but limiter should have blocked it
-            print(f"FAIL: expected OOM for {big_width}x{big_height}")
-            hip.free(ptr2)
-        except Exception as exc:
-            if "OutOfMemory" in str(exc) or "code 2" in str(exc):
-                print("PASS")
-            else:
-                print(f"FAIL: unexpected error: {exc}")
-    """)
-    assert result.succeeded, f"Subprocess failed: {result.stderr}"
-    assert "PASS" in result.stdout, f"malloc_pitch test failed: {result.stdout}"
 
 
 def test_alloc_shm_accounting(cts):
@@ -330,23 +298,13 @@ def test_alloc_shm_accounting(cts):
             assert used_after == 0, f"Expected SHM used=0 after free, got {used_after}"
 
 
-class TestMallocPitchAccounting:
-    """hipMallocPitch accounting tracks pitch*height (actual GPU consumption).
+def _assert_pitched_2d_accounting(cts, alloc_call, api_name, width, height):
+    """Verify SHM pod_memory_used == pitch * height after a 2D pitched allocation.
 
-    The GPU allocates pitch*height bytes where pitch >= width due to alignment.
-    The limiter reserves width*height upfront, then adjusts to pitch*height after
-    the native call returns the actual pitch. This prevents memory limit bypass
-    via narrow pitched allocations with large alignment overhead.
-
-    Gap: Previously tracked width*height which underreported actual GPU usage.
+    Used by both hipMallocPitch and hipMemAllocPitch accounting tests.
+    alloc_call: format string with {width} and {height} placeholders that sets ptr, pitch.
     """
-
-    def test_malloc_pitch_tracks_pitch_times_height(self, cts):
-        """Allocate with hipMallocPitch, verify pod_memory_used == pitch * height."""
-        width = 1024
-        height = 1024
-
-        script = f"""\
+    script = f"""\
 import os
 from hip_helper import HIPRuntime, HIP_SUCCESS
 from shm_writer import read_pod_memory_used
@@ -356,7 +314,7 @@ shm_path = os.environ["TF_SHM_FILE"]
 
 used_before = read_pod_memory_used(shm_path, 0)
 
-ptr, pitch = hip.malloc_pitch({width}, {height})
+{alloc_call.format(width=width, height=height)}
 print(f"PITCH={{pitch}}")
 print(f"WIDTH={width}")
 print(f"HEIGHT={height}")
@@ -369,19 +327,36 @@ print(f"SHM_DELTA={{delta}}")
 hip.free(ptr)
 print("DONE")
 """
-        result = cts.run_hip_test(script)
-        assert result.succeeded, f"Subprocess failed:\n{result.output}"
-        assert "DONE" in result.stdout, f"Script did not complete:\n{result.stdout}"
+    result = cts.run_hip_test(script)
+    assert result.succeeded, f"Subprocess failed:\n{result.output}"
+    assert "DONE" in result.stdout, f"Script did not complete:\n{result.stdout}"
 
-        values = parse_kv_output(result.stdout)
-        shm_delta = values["SHM_DELTA"]
-        pitch = values["PITCH"]
-        pitch_x_height = values["PITCH_X_HEIGHT"]
+    values = parse_kv_output(result.stdout)
+    shm_delta = values["SHM_DELTA"]
+    pitch_x_height = values["PITCH_X_HEIGHT"]
 
-        assert shm_delta == pitch_x_height, (
-            f"SHM tracked {shm_delta} bytes but expected pitch*height={pitch_x_height}. "
-            f"pitch={pitch}, width={width}. "
-            f"The limiter should track pitch*height (actual GPU consumption)."
+    assert shm_delta == pitch_x_height, (
+        f"{api_name}: SHM tracked {shm_delta} bytes but expected pitch*height={pitch_x_height}. "
+        f"pitch={values['PITCH']}, width={width}. "
+        f"The limiter should track pitch*height (actual GPU consumption)."
+    )
+
+
+class TestMallocPitchAccounting:
+    """hipMallocPitch accounting tracks pitch*height (actual GPU consumption)."""
+
+    def test_malloc_pitch_tracks_pitch_times_height(self, cts):
+        _assert_pitched_2d_accounting(
+            cts, _PITCH_ALLOC_2D, "hipMallocPitch", width=1024, height=1024,
+        )
+
+
+class TestMemAllocPitchAccounting:
+    """hipMemAllocPitch (driver API) accounting tracks pitch*height (actual GPU consumption)."""
+
+    def test_mem_alloc_pitch_tracks_pitch_times_height(self, cts):
+        _assert_pitched_2d_accounting(
+            cts, _PITCH_ALLOC_2D_DRIVER, "hipMemAllocPitch", width=1024, height=1024,
         )
 
 
@@ -497,6 +472,7 @@ print("DONE")
 # Pitched alloc calls used by discovery and denial helpers.
 # Each must set `ptr` and `pitch` variables in the subprocess script scope.
 _PITCH_ALLOC_2D = "ptr, pitch = hip.malloc_pitch({width}, {height})"
+_PITCH_ALLOC_2D_DRIVER = "ptr, pitch = hip.mem_alloc_pitch({width}, {height})"
 _PITCH_ALLOC_3D = "ptr, pitch, xsize, ysize = hip.malloc_3d({width}, {height}, {depth})"
 
 
@@ -517,6 +493,26 @@ class TestMallocPitchAlignmentOverhead:
             cts_factory,
             _PITCH_ALLOC_2D.format(width=self.WIDTH, height=self.HEIGHT),
             "hipMallocPitch", self.WIDTH, self.HEIGHT,
+        )
+
+
+class TestMemAllocPitchAlignmentOverhead:
+    """hipMemAllocPitch (driver API) alignment overhead can push an allocation over the limit."""
+
+    WIDTH, HEIGHT = 128, 1024
+
+    def test_pitch_overhead_denied_when_over_limit(self, cts_factory):
+        _assert_overhead_denied(
+            cts_factory,
+            _PITCH_ALLOC_2D_DRIVER.format(width=self.WIDTH, height=self.HEIGHT),
+            "hipMemAllocPitch", self.WIDTH, self.HEIGHT,
+        )
+
+    def test_pitch_overhead_shm_unchanged_after_denial(self, cts_factory):
+        _assert_overhead_shm_unchanged(
+            cts_factory,
+            _PITCH_ALLOC_2D_DRIVER.format(width=self.WIDTH, height=self.HEIGHT),
+            "hipMemAllocPitch", self.WIDTH, self.HEIGHT,
         )
 
 
@@ -744,6 +740,8 @@ hip.free(fill_ptr)
         # alignment overhead denial is covered by TestMallocPitch/3DAlignmentOverhead.
         "hipMallocPitch": _oom_script(
             "ptr, pitch = hip.malloc_pitch(over_size, 1)", "hip.free(ptr)"),
+        "hipMemAllocPitch": _oom_script(
+            "ptr, pitch = hip.mem_alloc_pitch(over_size, 1)", "hip.free(ptr)"),
         "hipMalloc3D": _oom_script(
             "ptr, pitch, xsize, ysize = hip.malloc_3d(over_size, 1, 1)", "hip.free(ptr)"),
     }

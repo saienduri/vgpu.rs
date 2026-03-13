@@ -75,6 +75,57 @@ def test_free_pair_tracking(cts, alloc_call, free_call, post_free):
     assert "PASS" in result.stdout, f"Free tracking failed: {result.stdout}"
 
 
+# --- Pitched alloc free tracking ---
+#
+# Pitched allocs return (ptr, pitch) so they don't fit the parametrized template
+# above (which expects `ptr = <expr>`). The tracked size is pitch*height, not
+# width*height, so the delta check also differs from the simple alloc pairs.
+
+_PITCHED_FREE_TRACKING_PAIRS = [
+    ("hipMallocPitch+hipFree", "hip.malloc_pitch(width, height)", "hip.free(ptr)"),
+    ("hipMemAllocPitch+hipFree", "hip.mem_alloc_pitch(width, height)", "hip.free(ptr)"),
+]
+
+
+@pytest.mark.parametrize(
+    "alloc_call,free_call",
+    [(a, f) for _, a, f in _PITCHED_FREE_TRACKING_PAIRS],
+    ids=[tid for tid, _, _ in _PITCHED_FREE_TRACKING_PAIRS],
+)
+def test_pitched_free_returns_to_zero(cts, alloc_call, free_call):
+    """Pitched alloc + free should return pod_memory_used to zero."""
+    width, height = 1024, 512
+    result = cts.run_hip_test(f"""
+        import os
+        from hip_helper import HIPRuntime
+        from shm_writer import read_pod_memory_used
+
+        hip = HIPRuntime()
+        shm_path = os.environ["TF_SHM_FILE"]
+        width, height = {width}, {height}
+
+        used_before = read_pod_memory_used(shm_path, 0)
+        ptr, pitch = {alloc_call}
+        used_after_alloc = read_pod_memory_used(shm_path, 0)
+        {free_call}
+        used_after_free = read_pod_memory_used(shm_path, 0)
+
+        delta_alloc = used_after_alloc - used_before
+        expected = pitch * height
+
+        print(f"delta_alloc={{delta_alloc}}")
+        print(f"expected={{expected}}")
+        print(f"after_free={{used_after_free}}")
+
+        if delta_alloc == expected and used_after_free == used_before:
+            print("PASS")
+        else:
+            print(f"FAIL: delta_alloc={{delta_alloc}} expected={{expected}} after_free={{used_after_free}} before={{used_before}}")
+    """)
+    assert result.succeeded, f"Subprocess failed: {result.stderr}"
+    assert "PASS" in result.stdout, f"Pitched free tracking failed: {result.stdout}"
+
+
 # --- Edge cases (not parametrizable — unique logic per test) ---
 
 def test_free_null_no_crash(cts):

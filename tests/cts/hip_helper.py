@@ -146,6 +146,10 @@ class HIPRuntime:
         lib.hipMallocPitch.restype = c_int
         lib.hipMallocPitch.argtypes = [POINTER(c_void_p), POINTER(c_size_t), c_size_t, c_size_t]
 
+        # hipError_t hipMemAllocPitch(hipDeviceptr_t* dptr, size_t* pitch, size_t widthInBytes, size_t height, unsigned int elementSizeBytes)
+        lib.hipMemAllocPitch.restype = c_int
+        lib.hipMemAllocPitch.argtypes = [POINTER(c_void_p), POINTER(c_size_t), c_size_t, c_size_t, c_uint]
+
         # hipError_t hipDeviceGetPCIBusId(char* pciBusId, int len, int device)
         lib.hipDeviceGetPCIBusId.restype = c_int
         lib.hipDeviceGetPCIBusId.argtypes = [ctypes.c_char_p, c_int, c_int]
@@ -294,6 +298,16 @@ class HIPRuntime:
         self._check(
             self._lib.hipMallocPitch(byref(ptr), byref(pitch), width, height),
             "hipMallocPitch",
+        )
+        return (ptr.value or 0), pitch.value
+
+    def mem_alloc_pitch(self, width: int, height: int, element_size: int = 4) -> Tuple[int, int]:
+        """Allocate pitched device memory via hipMemAllocPitch (driver API). Returns (pointer, pitch)."""
+        ptr = c_void_p(0)
+        pitch = c_size_t(0)
+        self._check(
+            self._lib.hipMemAllocPitch(byref(ptr), byref(pitch), width, height, element_size),
+            "hipMemAllocPitch",
         )
         return (ptr.value or 0), pitch.value
 

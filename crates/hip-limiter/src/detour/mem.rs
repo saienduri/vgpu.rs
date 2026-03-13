@@ -117,7 +117,7 @@ macro_rules! check_and_free {
 
 /// Two-phase pitched allocation: reserve estimated, call native, reserve alignment overhead.
 ///
-/// Shared implementation for hipMallocPitch and hipMalloc3D. The GPU allocates
+/// Shared implementation for hipMallocPitch, hipMemAllocPitch, and hipMalloc3D. The GPU allocates
 /// `pitch * height [* depth]` bytes where `pitch >= width` due to alignment, but
 /// we only know `pitch` after the native call returns.
 ///
@@ -313,7 +313,7 @@ pub(crate) unsafe extern "C" fn hip_mem_alloc_host_detour(
 
 // --- Pitched allocation hooks ---
 //
-// hipMallocPitch and hipMalloc3D use a two-phase reserve pattern via check_and_alloc_pitched!
+// hipMallocPitch, hipMemAllocPitch, and hipMalloc3D use a two-phase reserve pattern via check_and_alloc_pitched!
 // because the actual GPU allocation size depends on pitch alignment (pitch >= width), which
 // is only known after the native call returns.
 
@@ -337,6 +337,34 @@ pub(crate) unsafe extern "C" fn hip_malloc_pitch_detour(
         estimated_size,
         FN_HIP_MALLOC_PITCH(ptr, pitch, width, height),
         *ptr,
+        *pitch,
+        |actual_pitch: usize| actual_pitch.checked_mul(height)
+    )
+}
+
+/// Driver API version of hipMallocPitch. Same two-phase pitched pattern;
+/// elementSizeBytes influences pitch alignment but doesn't affect accounting.
+#[hook_fn]
+pub(crate) unsafe extern "C" fn hip_mem_alloc_pitch_detour(
+    dptr: *mut *mut c_void,
+    pitch: *mut usize,
+    width_in_bytes: usize,
+    height: usize,
+    element_size_bytes: c_uint,
+) -> HipError {
+    let Some(estimated_size) = checked_pitched_size(&[width_in_bytes, height]) else {
+        return HIP_ERROR_OUT_OF_MEMORY;
+    };
+
+    if estimated_size == 0 {
+        return FN_HIP_MEM_ALLOC_PITCH(dptr, pitch, width_in_bytes, height, element_size_bytes);
+    }
+
+    check_and_alloc_pitched!(
+        "hipMemAllocPitch",
+        estimated_size,
+        FN_HIP_MEM_ALLOC_PITCH(dptr, pitch, width_in_bytes, height, element_size_bytes),
+        *dptr,
         *pitch,
         |actual_pitch: usize| actual_pitch.checked_mul(height)
     )
@@ -530,7 +558,7 @@ pub(crate) unsafe fn enable_hooks(hook_manager: &mut HookManager) -> Result<(), 
         FN_HIP_MALLOC_FROM_POOL_ASYNC
     )?;
     // Free hooks must be registered before pitched alloc hooks (hipMallocPitch,
-    // hipMalloc3D) because check_and_alloc_pitched! calls FN_HIP_FREE on the
+    // hipMemAllocPitch, hipMalloc3D) because check_and_alloc_pitched! calls FN_HIP_FREE on the
     // rollback path. Registration order doesn't affect runtime correctness (all
     // hooks are installed before any are invoked), but keeping this order makes
     // the dependency explicit for future maintainers.
@@ -573,6 +601,14 @@ pub(crate) unsafe fn enable_hooks(hook_manager: &mut HookManager) -> Result<(), 
         hip_malloc_pitch_detour,
         FnHip_malloc_pitch,
         FN_HIP_MALLOC_PITCH
+    )?;
+    replace_symbol!(
+        hook_manager,
+        Some("libamdhip64."),
+        "hipMemAllocPitch",
+        hip_mem_alloc_pitch_detour,
+        FnHip_mem_alloc_pitch,
+        FN_HIP_MEM_ALLOC_PITCH
     )?;
     replace_symbol!(
         hook_manager,
