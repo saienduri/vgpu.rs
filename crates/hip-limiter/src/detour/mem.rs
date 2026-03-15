@@ -1,5 +1,4 @@
-use std::ffi::c_uint;
-use std::ffi::c_void;
+use std::ffi::{c_uint, c_ulonglong, c_void};
 
 use tf_macro::hook_fn;
 use utils::hooks::HookManager;
@@ -427,6 +426,42 @@ pub(crate) unsafe extern "C" fn hip_free_async_detour(
     check_and_free!(ptr, FN_HIP_FREE_ASYNC(ptr, stream))
 }
 
+// --- Virtual memory management hooks ---
+//
+// hipMemCreate/hipMemRelease use opaque handles (not device pointers) to track
+// physical GPU memory allocations. The handle is stored in the same DashMap as
+// device pointers — the keyspaces don't collide because handles are host-heap
+// pointers while device pointers are GPU virtual addresses.
+
+/// hipMemCreate allocates physical GPU memory backing, returning an opaque handle.
+/// The size parameter is the allocation size in bytes (must be granularity-aligned).
+/// We pass `prop` as opaque (*const c_void) since we only need `size` for accounting.
+#[hook_fn]
+pub(crate) unsafe extern "C" fn hip_mem_create_detour(
+    handle: *mut *mut c_void,
+    size: usize,
+    prop: *const c_void,
+    flags: c_ulonglong,
+) -> HipError {
+    let request_size = size as u64;
+    check_and_alloc!(handle, request_size, "hipMemCreate", || {
+        FN_HIP_MEM_CREATE(handle, size, prop, flags)
+    })
+}
+
+/// hipMemRelease frees a physical GPU memory handle previously created by hipMemCreate.
+///
+/// Handles obtained via hipMemRetainAllocationHandle or hipMemImportFromShareableHandle
+/// are intentionally untracked — the limiter only accounts for the original hipMemCreate.
+/// A retain'd handle's release decrements the internal refcount but the tracker entry
+/// belongs to the original handle, so the second release is a safe no-op (over-reports).
+#[hook_fn]
+pub(crate) unsafe extern "C" fn hip_mem_release_detour(
+    handle: *mut c_void,
+) -> HipError {
+    check_and_free!(handle, FN_HIP_MEM_RELEASE(handle))
+}
+
 // --- Info spoofing hooks ---
 
 #[hook_fn]
@@ -593,6 +628,22 @@ pub(crate) unsafe fn enable_hooks(hook_manager: &mut HookManager) -> Result<(), 
         hip_free_async_detour,
         FnHip_free_async,
         FN_HIP_FREE_ASYNC
+    )?;
+    replace_symbol!(
+        hook_manager,
+        Some("libamdhip64."),
+        "hipMemCreate",
+        hip_mem_create_detour,
+        FnHip_mem_create,
+        FN_HIP_MEM_CREATE
+    )?;
+    replace_symbol!(
+        hook_manager,
+        Some("libamdhip64."),
+        "hipMemRelease",
+        hip_mem_release_detour,
+        FnHip_mem_release,
+        FN_HIP_MEM_RELEASE
     )?;
     replace_symbol!(
         hook_manager,

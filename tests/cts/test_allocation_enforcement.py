@@ -247,6 +247,15 @@ ptr, pitch, xsize, ysize = hip.malloc_3d(1024, 1024, 1)
 print("ALLOC_OK")
 hip.free(ptr)
 """,
+    "hipMemCreate": """\
+from hip_helper import HIPRuntime
+hip = HIPRuntime()
+granularity = hip.get_allocation_granularity(0)
+size = ((1024 * 1024 + granularity - 1) // granularity) * granularity
+handle = hip.mem_create(size, 0)
+print("ALLOC_OK")
+hip.mem_release(handle)
+""",
 }
 
 
@@ -629,6 +638,44 @@ print("DONE")
         )
 
 
+class TestMemCreateAccounting:
+    """hipMemCreate/hipMemRelease accounting via opaque handles."""
+
+    def test_mem_create_tracks_size(self, cts):
+        """hipMemCreate should track the requested size in SHM accounting."""
+        result = cts.run_hip_test("""\
+import os
+from hip_helper import HIPRuntime
+from shm_writer import read_pod_memory_used
+
+hip = HIPRuntime()
+shm_path = os.environ["TF_SHM_FILE"]
+
+granularity = hip.get_allocation_granularity(0)
+alloc_size = ((16 * 1024 * 1024 + granularity - 1) // granularity) * granularity
+
+used_before = read_pod_memory_used(shm_path, 0)
+handle = hip.mem_create(alloc_size, 0)
+used_after_alloc = read_pod_memory_used(shm_path, 0)
+hip.mem_release(handle)
+used_after_free = read_pod_memory_used(shm_path, 0)
+
+delta_alloc = used_after_alloc - used_before
+delta_free = used_after_alloc - used_after_free
+
+print(f"alloc_size={alloc_size}")
+print(f"delta_alloc={delta_alloc}")
+print(f"delta_free={delta_free}")
+
+if delta_alloc == alloc_size and delta_free == alloc_size:
+    print("PASS")
+else:
+    print(f"FAIL: delta_alloc={delta_alloc} delta_free={delta_free} expected={alloc_size}")
+""")
+        assert result.succeeded, f"Subprocess failed: {result.stderr}"
+        assert "PASS" in result.stdout, f"hipMemCreate accounting failed: {result.stdout}"
+
+
 class TestMalloc3DAlignmentOverhead:
     """hipMalloc3D alignment overhead can push an allocation over the limit."""
 
@@ -744,6 +791,11 @@ hip.free(fill_ptr)
             "ptr, pitch = hip.mem_alloc_pitch(over_size, 1)", "hip.free(ptr)"),
         "hipMalloc3D": _oom_script(
             "ptr, pitch, xsize, ysize = hip.malloc_3d(over_size, 1, 1)", "hip.free(ptr)"),
+        "hipMemCreate": _oom_script(
+            "aligned = ((over_size + granularity - 1) // granularity) * granularity\n"
+            "    handle = hip.mem_create(aligned, 0)",
+            "hip.mem_release(handle)",
+            preamble="granularity = hip.get_allocation_granularity(0)"),
     }
 
     @pytest.mark.parametrize("variant", list(VARIANT_SCRIPTS.keys()))

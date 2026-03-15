@@ -126,6 +126,41 @@ def test_pitched_free_returns_to_zero(cts, alloc_call, free_call):
     assert "PASS" in result.stdout, f"Pitched free tracking failed: {result.stdout}"
 
 
+# --- Handle-based free tracking (hipMemCreate/hipMemRelease) ---
+#
+# hipMemCreate uses opaque handles rather than device pointers, so it doesn't
+# fit the parametrized template above. The alloc size must be granularity-aligned.
+
+def test_mem_create_release_returns_to_zero(cts):
+    """hipMemRelease should return pod_memory_used to zero after releasing a hipMemCreate handle."""
+    result = cts.run_hip_test("""
+        import os
+        from hip_helper import HIPRuntime
+        from shm_writer import read_pod_memory_used
+
+        hip = HIPRuntime()
+        shm_path = os.environ["TF_SHM_FILE"]
+
+        granularity = hip.get_allocation_granularity(0)
+        alloc_size = ((16 * 1024 * 1024 + granularity - 1) // granularity) * granularity
+
+        used_before = read_pod_memory_used(shm_path, 0)
+        handle = hip.mem_create(alloc_size, 0)
+        hip.mem_release(handle)
+        used_after_release = read_pod_memory_used(shm_path, 0)
+
+        print(f"before={used_before}")
+        print(f"after_release={used_after_release}")
+
+        if used_after_release == used_before:
+            print("PASS")
+        else:
+            print(f"FAIL: expected {used_before}, got {used_after_release}")
+    """)
+    assert result.succeeded, f"Subprocess failed: {result.stderr}"
+    assert "PASS" in result.stdout, f"hipMemRelease tracking failed: {result.stdout}"
+
+
 # --- Edge cases (not parametrizable — unique logic per test) ---
 
 def test_free_null_no_crash(cts):

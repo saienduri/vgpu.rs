@@ -14,7 +14,7 @@ All methods raise HIPError on failure (non-zero hipError_t return).
 
 import ctypes
 import os
-from ctypes import POINTER, byref, c_int, c_size_t, c_uint, c_void_p
+from ctypes import POINTER, Structure, byref, c_int, c_size_t, c_ubyte, c_uint, c_ulonglong, c_ushort, c_void_p
 from typing import Optional, Tuple
 
 
@@ -24,6 +24,39 @@ HIP_SUCCESS = 0
 HIP_ERROR_INVALID_VALUE = 1
 HIP_ERROR_OUT_OF_MEMORY = 2
 HIP_ERROR_NOT_INITIALIZED = 3
+
+# ── Virtual memory management types ──
+
+# hipMemLocationType enum
+HIP_MEM_LOCATION_TYPE_DEVICE = 1
+
+# hipMemAllocationType enum
+HIP_MEM_ALLOCATION_TYPE_PINNED = 0x1
+
+# hipMemAllocationGranularity_flags enum
+HIP_MEM_ALLOC_GRANULARITY_MINIMUM = 0x0
+
+
+class HipMemLocation(Structure):
+    _fields_ = [("type", c_int), ("id", c_int)]
+
+
+class _HipMemAllocFlags(Structure):
+    _fields_ = [
+        ("compressionType", c_ubyte),
+        ("gpuDirectRDMACapable", c_ubyte),
+        ("usage", c_ushort),
+    ]
+
+
+class HipMemAllocationProp(Structure):
+    _fields_ = [
+        ("type", c_int),                    # hipMemAllocationType
+        ("requestedHandleType", c_int),     # hipMemAllocationHandleType (union)
+        ("location", HipMemLocation),
+        ("win32HandleMetaData", c_void_p),
+        ("allocFlags", _HipMemAllocFlags),
+    ]
 
 
 class HIPError(Exception):
@@ -149,6 +182,18 @@ class HIPRuntime:
         # hipError_t hipMemAllocPitch(hipDeviceptr_t* dptr, size_t* pitch, size_t widthInBytes, size_t height, unsigned int elementSizeBytes)
         lib.hipMemAllocPitch.restype = c_int
         lib.hipMemAllocPitch.argtypes = [POINTER(c_void_p), POINTER(c_size_t), c_size_t, c_size_t, c_uint]
+
+        # hipError_t hipMemCreate(hipMemGenericAllocationHandle_t* handle, size_t size, const hipMemAllocationProp* prop, unsigned long long flags)
+        lib.hipMemCreate.restype = c_int
+        lib.hipMemCreate.argtypes = [POINTER(c_void_p), c_size_t, POINTER(HipMemAllocationProp), c_ulonglong]
+
+        # hipError_t hipMemRelease(hipMemGenericAllocationHandle_t handle)
+        lib.hipMemRelease.restype = c_int
+        lib.hipMemRelease.argtypes = [c_void_p]
+
+        # hipError_t hipMemGetAllocationGranularity(size_t* granularity, const hipMemAllocationProp* prop, hipMemAllocationGranularity_flags option)
+        lib.hipMemGetAllocationGranularity.restype = c_int
+        lib.hipMemGetAllocationGranularity.argtypes = [POINTER(c_size_t), POINTER(HipMemAllocationProp), c_uint]
 
         # hipError_t hipDeviceGetPCIBusId(char* pciBusId, int len, int device)
         lib.hipDeviceGetPCIBusId.restype = c_int
@@ -345,6 +390,51 @@ class HIPRuntime:
     def free_host_raw(self, ptr: int) -> int:
         """Like free_host but returns the raw hipError_t code instead of raising."""
         return self._lib.hipFreeHost(c_void_p(ptr))
+
+    def get_allocation_granularity(self, device: int = 0) -> int:
+        """Get the minimum allocation granularity for hipMemCreate on a device."""
+        granularity = c_size_t(0)
+        prop = HipMemAllocationProp(
+            type=HIP_MEM_ALLOCATION_TYPE_PINNED,
+            location=HipMemLocation(type=HIP_MEM_LOCATION_TYPE_DEVICE, id=device),
+        )
+        self._check(
+            self._lib.hipMemGetAllocationGranularity(
+                byref(granularity), byref(prop), HIP_MEM_ALLOC_GRANULARITY_MINIMUM,
+            ),
+            "hipMemGetAllocationGranularity",
+        )
+        return granularity.value
+
+    def mem_create(self, size: int, device: int = 0) -> int:
+        """Allocate physical GPU memory via hipMemCreate. Returns opaque handle as integer.
+
+        size must be aligned to the allocation granularity (use get_allocation_granularity()).
+        """
+        handle = c_void_p(0)
+        prop = HipMemAllocationProp(
+            type=HIP_MEM_ALLOCATION_TYPE_PINNED,
+            location=HipMemLocation(type=HIP_MEM_LOCATION_TYPE_DEVICE, id=device),
+        )
+        self._check(
+            self._lib.hipMemCreate(byref(handle), size, byref(prop), 0),
+            "hipMemCreate",
+        )
+        return handle.value or 0
+
+    def mem_create_raw(self, size: int, device: int = 0) -> Tuple[int, int]:
+        """Like mem_create but returns (error_code, handle) instead of raising."""
+        handle = c_void_p(0)
+        prop = HipMemAllocationProp(
+            type=HIP_MEM_ALLOCATION_TYPE_PINNED,
+            location=HipMemLocation(type=HIP_MEM_LOCATION_TYPE_DEVICE, id=device),
+        )
+        err = self._lib.hipMemCreate(byref(handle), size, byref(prop), 0)
+        return err, (handle.value or 0)
+
+    def mem_release(self, handle: int) -> None:
+        """Release physical GPU memory via hipMemRelease."""
+        self._check(self._lib.hipMemRelease(c_void_p(handle)), "hipMemRelease")
 
     def malloc_3d(self, width: int, height: int, depth: int) -> Tuple[int, int, int, int]:
         """Allocate 3D pitched device memory via hipMalloc3D.
