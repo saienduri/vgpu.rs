@@ -1073,6 +1073,22 @@ pub struct DeviceConfig {
     pub total_cuda_cores: u32,
 }
 
+impl DeviceConfig {
+    /// Config for memory-only enforcement (no compute limiting).
+    /// Sets `up_limit = 100` (unlimited utilization) and zeroes compute fields.
+    pub fn memory_only(device_idx: u32, device_uuid: String, mem_limit: u64) -> Self {
+        Self {
+            device_idx,
+            device_uuid,
+            up_limit: 100,
+            mem_limit,
+            sm_count: 0,
+            max_thread_per_sm: 0,
+            total_cuda_cores: 0,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;

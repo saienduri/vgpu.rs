@@ -1,6 +1,6 @@
 # hip-limiter Design
 
-A cdylib loaded via `LD_PRELOAD` that intercepts HIP GPU memory allocation APIs, enforces per-pod VRAM limits, and reports usage to the hypervisor through shared memory.
+A cdylib loaded via `LD_PRELOAD` that intercepts HIP GPU memory allocation APIs, enforces per-pod VRAM limits, and reports usage through shared memory.
 
 ## How It Works
 
@@ -18,12 +18,53 @@ LD_PRELOAD → hip-limiter.so (Frida GUM inline hooks)
 
 The limiter is transparent to applications. Frameworks see their pod's VRAM limit as the total GPU memory (via spoofed `hipMemGetInfo`/`hipDeviceTotalMem`/SMI queries), and allocations that exceed the limit return `hipErrorOutOfMemory`.
 
+## Operating Modes
+
+The limiter supports three operating modes, selected by environment variables:
+
+| Priority | Mode | Trigger | SHM Source | Config Source |
+|----------|------|---------|------------|---------------|
+| 1 | **Standalone** | `TF_MEMORY_LIMIT` set | Self-created | GPU auto-discovery via HIP |
+| 2 | **Mock/test** | `TF_SHM_FILE` + `TF_VISIBLE_DEVICES` set | Local file | `TF_VISIBLE_DEVICES` env var |
+| 3 | **Production** | Neither set | Hypervisor-created | Hypervisor REST API |
+
+If both `TF_MEMORY_LIMIT` and `TF_SHM_FILE` are set, standalone wins with a warning.
+
+### Standalone Mode
+
+Enables VRAM enforcement with just `LD_PRELOAD` + `TF_MEMORY_LIMIT` — no K8s operator or Go hypervisor needed. Designed for bare-metal runners, CI pipelines, and DinD workloads.
+
+Init flow:
+1. Parse `TF_MEMORY_LIMIT` via `size_parser::parse_memory_limit()` → bytes
+2. Enumerate all visible GPUs via `hipGetDeviceCount` + `hipDeviceGetPCIBusId`
+3. Build `DeviceConfig` per GPU: `mem_limit` from env var, `up_limit: 100` (no compute throttling), `sm_count`/`max_thread_per_sm`/`total_cuda_cores: 0` (unused without ERL)
+4. Create SHM via `SharedMemoryHandle::create(shm_path, &configs)` at `{SHM_PATH}/shm` (default `/dev/shm/tensor-fusion/shm`). If SHM already exists (`LinkExists`), joins it. Both paths write fresh state with zeroed counters.
+5. Construct `Limiter` with `isolation = Some("soft")`, `standalone = true`
+6. Eagerly inject the SHM handle into the limiter's `OnceCell` via `set_shared_memory_handle()`
+7. Install hooks as normal — all hooks work identically across modes
+
+**Heartbeat suppression:** In standalone mode there is no hypervisor writing heartbeats. The `standalone` flag suppresses heartbeat stale warnings in `try_reserve` and `get_pod_memory_usage`. This is log-noise reduction only — `is_healthy()` never blocks allocations.
+
+**SHM multi-process safety:** When multiple preloaded processes start concurrently, the first creates the SHM segment and subsequent processes join via `LinkExists`. Both paths call `ptr.write(SharedDeviceState::new(configs))`, so the race is between two identical writes (same `TF_MEMORY_LIMIT` → same `configs`). Write order does not matter.
+
+**SHM cleanup:** `set_owner(false)` means the segment persists after process exit. The default path (`/dev/shm/tensor-fusion`) is on tmpfs, cleaned up on reboot. In containers, tmpfs is cleaned up on pod termination.
+
+**Size parser** (`size_parser.rs`): Parses human-readable memory limits — plain bytes (`137438953472`), SI suffixes (`126G`, `126GB`, `512M`), binary suffixes (`126GiB`, `512MiB`). Case-insensitive. Returns `None` for zero, negative, overflow, or unparseable input.
+
+### Production Mode
+
+Blocking HTTP call to hypervisor API (`GET /api/v1/pod`) using K8s service account auth, with pod identity from `POD_NAME`, `POD_NAMESPACE`, `CONTAINER_NAME` env vars (injected via K8s downward API). Timeout: 15s connect, 30s total. If the hypervisor is unreachable, the limiter is never initialized and all hooks become passthrough (no enforcement).
+
+### Mock/Test Mode
+
+Reads `TF_SHM_FILE` and `TF_VISIBLE_DEVICES` env vars. SHM is lazily opened on first hook invocation via `OnceCell`.
+
 ## Init Flow
 
 1. **Library load** — `#[ctor] entry_point()` runs when `LD_PRELOAD` loads the cdylib.
-2. **Config fetch** — blocking HTTP call to hypervisor API (`GET /api/v1/pod`) using K8s service account auth, with pod identity from `POD_NAME`, `POD_NAMESPACE`, `CONTAINER_NAME` env vars (injected via K8s downward API). Timeout: 15s connect, 30s total. If the hypervisor is unreachable, the limiter is never initialized and all hooks become passthrough (no enforcement). In test mode, reads `TF_SHM_FILE` and `TF_VISIBLE_DEVICES` env vars instead.
+2. **Config resolution** — selects operating mode per the priority table above.
 3. **Device mapping** — enumerates HIP devices, matches against config UUIDs by PCI BDF normalization (strips `amd-gpu-` prefix, lowercases).
-4. **SHM attach** — deferred. SHM is lazily opened on first hook invocation via `OnceCell`, not at init time. If SHM is unavailable at that point, the hook falls through per-call rather than failing globally.
+4. **SHM attach** — eager in standalone mode (created and injected at init), deferred in other modes (lazily opened on first hook invocation via `OnceCell`).
 5. **Isolation check** — hooks activate when isolation mode is `"soft"` or unset (`None`). Only an explicitly non-`"soft"` value skips hook installation.
 6. **Hook installation** — creates a Frida GUM `HookManager`, replaces 30 symbols in `libamdhip64.so` via inline hooks. Guarded by `catch_unwind` to prevent hook installation panics from crashing the host application. Installs a `dlsym` detour to catch late-loaded libraries (SMI libs loaded with `RTLD_LOCAL`). If `libamdhip64.so` is not yet loaded, installation is deferred until a `dlsym` call resolves a HIP symbol.
 
@@ -59,19 +100,25 @@ The `Limiter` struct:
 
 | Field | Type | Purpose |
 |-------|------|---------|
-| `shared_memory_handle` | `OnceCell<Arc<SharedMemoryHandle>>` | Lazily opened POSIX SHM with V2 device state |
-| `gpu_idx_uuids` | `Vec<(usize, String)>` | Configured devices from hypervisor, sorted by index |
+| `shared_memory_handle` | `OnceCell<Arc<SharedMemoryHandle>>` | POSIX SHM with V2 device state (lazy in prod, eager in standalone) |
+| `gpu_idx_uuids` | `Vec<(usize, String)>` | Configured devices, sorted by index |
 | `hip_device_mapping` | `DashMap<HipDevice, (usize, String)>` | Cache: HIP device ordinal → (raw_idx, uuid) |
 | `allocation_tracker` | `DashMap<usize, (usize, u64)>` | pointer → (device_idx, size) |
 | `isolation` | `Option<String>` | Must be `"soft"` or `None` for enforcement |
+| `standalone` | `bool` | Suppresses heartbeat warnings when `true` |
 
 Key methods:
 - `try_reserve(device_idx, size)` — atomic `fetch_add` on SHM, rollback if over limit
 - `rollback_reservation(device_idx, size)` — undo a reservation after native failure
 - `record_allocation(device_idx, ptr, size)` — insert into DashMap
 - `record_free(ptr)` — remove from DashMap, `saturating_fetch_sub` on SHM
+- `set_shared_memory_handle(handle)` — eagerly set SHM for standalone mode
 - `device_index_by_hip_device(hip_device)` — resolves HIP ordinal to SHM device index via PCI BDF
 - `device_index_by_pci_bdf(bdf)` — resolves PCI BDF to device index (used by amdsmi hooks)
+
+### `size_parser.rs` — Memory Limit Parser
+
+Parses `TF_MEMORY_LIMIT` strings into bytes. Supports SI suffixes (G/GB/M/MB — powers of 1000), binary suffixes (GiB/MiB — powers of 1024), plain bytes, and fractional values (1.5G). Case-insensitive.
 
 ### `detour/mem.rs` — HIP API Hooks
 
@@ -116,20 +163,20 @@ SharedDeviceStateV2:
     uuid: [u8; 64]                   — GPU UUID string
     is_active: AtomicU32             — device active flag
     device_info: SharedDeviceInfoV2
-      mem_limit: AtomicU64           — VRAM limit in bytes (Go writes)
+      mem_limit: AtomicU64           — VRAM limit in bytes (Go writes, or standalone self-writes)
       pod_memory_used: AtomicU64     — current usage (Rust reads/writes)
       up_limit: AtomicU32            — utilization percentage
       total_cuda_cores: AtomicU32    — compute cores
       erl_*: ...                     — ERL token bucket fields (future compute enforcement)
   device_count: AtomicU32
-  last_heartbeat: AtomicU64          — staleness detection (2s threshold)
+  last_heartbeat: AtomicU64          — staleness detection (2s threshold, suppressed in standalone)
   pids: ShmMutex<Set<usize, 2048>>   — tracked process IDs
 ```
 
-**Go writes:** `mem_limit`, `up_limit`, `last_heartbeat`, device UUIDs.
-**Rust writes:** `pod_memory_used` (via atomics — `fetch_add` on alloc, saturating CAS loop on free).
+**Production:** Go writes `mem_limit`, `up_limit`, `last_heartbeat`, device UUIDs. Rust writes `pod_memory_used`.
+**Standalone:** Rust writes everything at init via `SharedDeviceState::new()`, then writes `pod_memory_used` at runtime.
 
-SHM is mounted as a shared `tmpfs` volume. `SHM_PATH` env var specifies the directory (default `/run/tensor-fusion/shm`); the actual file is `{SHM_PATH}/shm`. Must be accessible from both the hypervisor sidecar and application container.
+SHM path: `{SHM_PATH}/shm`. Default is `/dev/shm/tensor-fusion` in standalone mode, `/run/tensor-fusion/shm` in production (mounted by K8s operator). `SharedMemoryHandle::create` calls `create_dir_all` and temporarily sets `umask(0)` for world-readable permissions.
 
 ## Allocation Tracker
 
@@ -186,12 +233,13 @@ AMD GPU UUIDs are PCI BDF-based. Three naming conventions exist:
 
 | Variable | Required | Default | Purpose |
 |----------|----------|---------|---------|
+| `TF_MEMORY_LIMIT` | Yes (standalone) | — | Per-GPU VRAM limit (e.g., `126G`, `126GiB`, `1073741824`) |
 | `HYPERVISOR_IP` | Yes (production) | — | Hypervisor sidecar IP address |
 | `HYPERVISOR_PORT` | Yes (production) | — | Hypervisor sidecar port |
 | `POD_NAME` | Yes (production) | `""` | Pod name for hypervisor identification (K8s downward API) |
 | `POD_NAMESPACE` | Yes (production) | `""` | Pod namespace for hypervisor identification |
 | `CONTAINER_NAME` | Yes (production) | `""` | Container name for hypervisor identification |
-| `SHM_PATH` | No | `/run/tensor-fusion/shm` | SHM directory (actual file is `{SHM_PATH}/shm`) |
+| `SHM_PATH` | No | `/dev/shm/tensor-fusion` (standalone) or `/run/tensor-fusion/shm` (prod) | SHM directory (actual file is `{SHM_PATH}/shm`) |
 | `ENABLE_HIP_HOOKS` | No | `true` | Set to `"false"` to disable all hooks (passthrough) |
 | `TF_SKIP_HOOKS_IF_NO_LIMIT` | No | `false` | Skip hooks when all devices have `up_limit >= 100` |
 | `TF_HIP_LIB_PATH` | No | `libamdhip64.so` | Override `libamdhip64.so` load path |
@@ -203,6 +251,32 @@ AMD GPU UUIDs are PCI BDF-based. Three naming conventions exist:
 | `TF_SHM_FILE` | No | — | Mock mode: use local file as SHM (bypasses hypervisor) |
 | `TF_VISIBLE_DEVICES` | No | — | Mock mode: comma-separated GPU UUIDs |
 
+## Deployment
+
+### Production (K8s with tensor-fusion operator)
+
+The operator injects `LD_PRELOAD`, hypervisor env vars, and SHM volume mount automatically.
+
+### Standalone (no operator)
+
+Build: `cargo build --release -p hip-limiter` → `target/release/libhip_limiter.so`
+
+```yaml
+env:
+  - name: LD_PRELOAD
+    value: /usr/lib/hip-limiter.so
+  - name: TF_MEMORY_LIMIT
+    value: "126G"
+```
+
+For DinD, add to Docker run flags:
+```
+-v /opt/hip-limiter/hip-limiter.so:/usr/lib/hip-limiter.so:ro
+-e LD_PRELOAD=/usr/lib/hip-limiter.so
+-e TF_MEMORY_LIMIT=126G
+```
+`/dev/shm` is shared between host and container by default, so no explicit SHM volume mount is needed. To isolate SHM between containers, set `SHM_PATH` to a per-container path.
+
 ## Failure Modes
 
 | Scenario | Behavior |
@@ -210,11 +284,15 @@ AMD GPU UUIDs are PCI BDF-based. Three naming conventions exist:
 | **Hypervisor unreachable at init** | Limiter is never initialized. All hooks become passthrough — no enforcement. Logged as warning on first hooked call. Init blocks application startup for up to 30s (connect + request timeout). |
 | **SHM unavailable at runtime** | SHM is lazily opened on first allocation via `OnceCell::get_or_try_init`. If open fails, the hook falls through to the native call (passthrough). Subsequent calls retry the `OnceCell` init. |
 | **SHM unavailable during free** | Pointer is removed from the DashMap tracker but `pod_memory_used` is never decremented, causing a permanent accounting leak for that allocation's size. |
-| **Stale heartbeat** | Logged as warning but enforcement continues with last-known limits. Heartbeat threshold is 2 seconds. Can be noisy under load since it's checked on every `try_reserve` call. |
+| **Stale heartbeat** | Logged as warning but enforcement continues with last-known limits. Heartbeat threshold is 2 seconds. Suppressed in standalone mode (no hypervisor to heartbeat). |
 | **`libamdhip64.so` not loaded** | Hooks are deferred until a `dlsym` call resolves a HIP symbol. If the library is never loaded (non-GPU workload), the limiter is a silent no-op. |
 | **Hook installation panic** | Caught by `catch_unwind`. Hooks are not installed, error is logged. Application continues without enforcement. |
 | **Crash between free and decrement** | Over-reports memory usage (safe direction). Requires pod restart or SHM recreation to reset. |
-| **`pod_memory_used` drift** | No manual reset mechanism. Hypervisor must recreate SHM or pod must be deleted. |
+| **`pod_memory_used` drift** | No manual reset mechanism. Hypervisor must recreate SHM or pod must be deleted. In standalone mode, restarting all preloaded processes re-creates SHM with zeroed counters. |
+| **Invalid `TF_MEMORY_LIMIT`** | Limiter is not initialized, all hooks become passthrough. Logged as error. |
+| **`TF_MEMORY_LIMIT` with no visible GPUs** | Limiter is not initialized, logged as error: "TF_MEMORY_LIMIT set but no GPUs visible". |
+| **SHM directory not writable** | `SharedMemoryHandle::create` fails on `create_dir_all` or `shmem.create()`. Limiter is not initialized, passthrough. |
+| **HIP runtime enumeration failure** | GPU driver not loaded or broken. `hipGetDeviceCount` fails, limiter logs error and becomes passthrough. |
 
 ## Supporting Crates
 
@@ -227,8 +305,8 @@ AMD GPU UUIDs are PCI BDF-based. Three naming conventions exist:
 
 ## Test Strategy
 
-1. **Rust unit tests** (`cargo test -p hip-limiter -p hip-limiter-fuzz -p utils`) — size computation, UUID normalization, device resolution, SHM compat. No GPU needed.
+1. **Rust unit tests** (`cargo test -p hip-limiter -p hip-limiter-fuzz -p utils`) — size parser, size computation, UUID normalization, device resolution, SHM compat. No GPU needed.
 2. **Proptest fuzzer** (`hip-limiter-fuzz`) — property-based tests for accounting invariants under concurrent access, edge cases (zero-size, max-size, double-free), multi-device routing.
-3. **CTS on real GPU** (`tests/cts/`) — Python tests on MI325X via Docker with TheRock ROCm 7.11. Tests all hook variants, allocation enforcement, free tracking, info spoofing, concurrency, and edge cases.
+3. **CTS on real GPU** (`tests/cts/`) — Python tests on MI325X via Docker with TheRock ROCm 7.11. Tests all hook variants, allocation enforcement, free tracking, info spoofing, concurrency, standalone mode, and edge cases.
 
 See [hip-memory-hook-coverage.md](hip-memory-hook-coverage.md) for the full hook inventory and known gaps.

@@ -10,6 +10,9 @@ use utils::shared_memory::{erl_adapter::ErlSharedMemoryAdapter, handle::SharedMe
 
 use crate::hiplib::{self, HipDevice, HipError};
 
+/// Isolation mode that activates memory enforcement hooks.
+pub(crate) const ISOLATION_SOFT: &str = "soft";
+
 #[derive(thiserror::Error, Debug)]
 pub(crate) enum Error {
     #[error("HIP error: {0}")]
@@ -45,6 +48,8 @@ pub(crate) struct Limiter {
     /// Process-local: pointer addresses are virtual and only meaningful within this process.
     /// The actual pod_memory_used counter lives in SHM (shared across processes).
     allocation_tracker: DashMap<usize, (usize, u64)>,
+    /// When true, heartbeat warnings are suppressed (no hypervisor to heartbeat).
+    standalone: bool,
 }
 
 impl std::fmt::Debug for Limiter {
@@ -95,6 +100,7 @@ impl Limiter {
     pub(crate) fn new(
         mut gpu_uuids: Vec<String>,
         isolation: Option<String>,
+        standalone: bool,
     ) -> Result<Self, Error> {
         gpu_uuids.sort();
         gpu_uuids.dedup();
@@ -122,7 +128,15 @@ impl Limiter {
             gpu_idx_uuids,
             isolation,
             allocation_tracker: DashMap::new(),
+            standalone,
         })
+    }
+
+    /// Eagerly set the SHM handle (used by standalone mode which creates its own SHM).
+    pub(crate) fn set_shared_memory_handle(&self, handle: SharedMemoryHandle) -> Result<(), Error> {
+        self.shared_memory_handle
+            .set(Arc::new(handle))
+            .map_err(|_| Error::SharedMemory(anyhow::anyhow!("SHM handle already set")))
     }
 
     fn get_or_init_shared_memory(&self) -> Result<&SharedMemoryHandle, Error> {
@@ -188,7 +202,7 @@ impl Limiter {
         let handle = self.get_or_init_shared_memory()?;
         let state = handle.get_state();
 
-        if !state.is_healthy(Duration::from_secs(2)) {
+        if !self.standalone && !state.is_healthy(Duration::from_secs(2)) {
             tracing::warn!(
                 device_idx = raw_device_index,
                 last_heartbeat = state.get_last_heartbeat(),
@@ -245,7 +259,7 @@ impl Limiter {
         let handle = self.get_or_init_shared_memory()?;
         let state = handle.get_state();
 
-        if !state.is_healthy(Duration::from_secs(2)) {
+        if !self.standalone && !state.is_healthy(Duration::from_secs(2)) {
             tracing::warn!(
                 device_idx = device_idx,
                 last_heartbeat = state.get_last_heartbeat(),
@@ -401,9 +415,7 @@ impl Limiter {
 }
 
 fn shm_path() -> PathBuf {
-    PathBuf::from(
-        &std::env::var("SHM_PATH").unwrap_or_else(|_| "/run/tensor-fusion/shm".to_string()),
-    )
+    PathBuf::from(crate::resolve_shm_path(false))
 }
 
 #[cfg(test)]

@@ -14,11 +14,13 @@ use tf_macro::hook_fn;
 use utils::hooks::HookManager;
 use utils::logging;
 use utils::replace_symbol;
+use utils::shared_memory::handle::SharedMemoryHandle;
 
 mod config;
 pub(crate) mod detour;
 mod hiplib;
 mod limiter;
+mod size_parser;
 
 static GLOBAL_LIMITER: OnceLock<Limiter> = OnceLock::new();
 static GLOBAL_LIMITER_ERROR: OnceLock<String> = OnceLock::new();
@@ -83,53 +85,135 @@ pub(crate) fn mock_shm_path() -> Option<PathBuf> {
         .ok()
 }
 
+/// SHM directory defaults per operating mode.
+const STANDALONE_SHM_DIR: &str = "/dev/shm/tensor-fusion";
+const PRODUCTION_SHM_DIR: &str = "/run/tensor-fusion/shm";
+
+pub(crate) fn resolve_shm_path(standalone: bool) -> String {
+    env::var("SHM_PATH").unwrap_or_else(|_| {
+        if standalone {
+            STANDALONE_SHM_DIR
+        } else {
+            PRODUCTION_SHM_DIR
+        }
+        .to_string()
+    })
+}
+
+/// Standalone mode: parse TF_MEMORY_LIMIT, enumerate GPUs, create SHM.
+fn init_standalone_config(
+    mem_limit_str: &str,
+) -> Result<(config::PodConfig, SharedMemoryHandle), String> {
+    if mock_shm_path().is_some() {
+        tracing::warn!("TF_MEMORY_LIMIT is set, ignoring TF_SHM_FILE");
+    }
+
+    let mem_limit = size_parser::parse_memory_limit(mem_limit_str)
+        .ok_or_else(|| format!("invalid TF_MEMORY_LIMIT value: '{mem_limit_str}'"))?;
+
+    let hip = hiplib::hiplib();
+    let device_count = hip
+        .get_device_count()
+        .map_err(|e| format!("failed to enumerate GPUs: {e}"))?;
+
+    if device_count == 0 {
+        return Err("TF_MEMORY_LIMIT set but no GPUs visible".to_string());
+    }
+
+    let mut gpu_uuids = Vec::with_capacity(device_count as usize);
+    let mut configs = Vec::with_capacity(device_count as usize);
+    for device_index in 0..device_count {
+        let pci_bus_id = hip
+            .get_pci_bus_id(device_index)
+            .map_err(|e| format!("failed to get PCI bus ID for device {device_index}: {e}"))?;
+        gpu_uuids.push(pci_bus_id.clone());
+        configs.push(utils::shared_memory::DeviceConfig::memory_only(
+            device_index as u32,
+            pci_bus_id,
+            mem_limit,
+        ));
+    }
+
+    let shm_path = resolve_shm_path(true);
+    let shm_handle = SharedMemoryHandle::create(&shm_path, &configs)
+        .map_err(|e| format!("failed to create SHM: {e}"))?;
+
+    tracing::info!(
+        mem_limit_bytes = mem_limit,
+        mem_limit_str = %mem_limit_str,
+        device_count = device_count,
+        "Standalone mode: created SHM with per-GPU limit"
+    );
+
+    Ok((
+        config::PodConfig {
+            gpu_uuids,
+            isolation: Some(limiter::ISOLATION_SOFT.to_string()),
+        },
+        shm_handle,
+    ))
+}
+
+/// Production mode: fetch config from hypervisor REST API.
+fn init_production_config() -> Result<config::PodConfig, String> {
+    let (hypervisor_ip, hypervisor_port) = config::get_hypervisor_config()
+        .ok_or("HYPERVISOR_IP or HYPERVISOR_PORT not set; skipping limiter init")?;
+
+    config::get_worker_config(&hypervisor_ip, &hypervisor_port)
+        .map_err(|error| format!("failed to get device configs: {error}"))
+}
+
+/// Mock/test mode: read GPU UUIDs from env.
+fn init_mock_config() -> Result<config::PodConfig, String> {
+    let uuids = env::var("TF_VISIBLE_DEVICES")
+        .map_err(|_| {
+            "TF_VISIBLE_DEVICES not set in mock/test mode; skipping limiter init".to_string()
+        })?
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>();
+
+    Ok(config::PodConfig {
+        gpu_uuids: uuids,
+        isolation: None,
+    })
+}
+
 fn init_limiter() {
     static LIMITER_INITIALIZED: Once = Once::new();
     LIMITER_INITIALIZED.call_once(|| {
-        match hiplib::init_hiplib() {
-            Ok(_) => {}
-            Err(error) => {
-                record_limiter_error(format!("failed to initialize HIP library: {error}"));
-                return;
-            }
-        };
+        if let Err(error) = hiplib::init_hiplib() {
+            record_limiter_error(format!("failed to initialize HIP library: {error}"));
+            return;
+        }
 
-        let config = if mock_shm_path().is_none() {
-            let (hypervisor_ip, hypervisor_port) = match config::get_hypervisor_config() {
-                Some((ip, port)) => (ip, port),
-                None => {
-                    record_limiter_error(
-                        "HYPERVISOR_IP or HYPERVISOR_PORT not set; skipping limiter init",
-                    );
+        // Config priority: TF_MEMORY_LIMIT (standalone) > TF_SHM_FILE (mock) > hypervisor (prod).
+        // Branch order below is standalone → prod → mock because the prod check tests
+        // "mock_shm_path is None" (i.e., TF_SHM_FILE is NOT set), with mock as the fallback.
+        let (config, standalone_shm) = if let Ok(mem_limit_str) = env::var("TF_MEMORY_LIMIT") {
+            match init_standalone_config(&mem_limit_str) {
+                Ok((config, shm)) => (config, Some(shm)),
+                Err(e) => {
+                    record_limiter_error(e);
                     return;
                 }
-            };
-
-            match config::get_worker_config(&hypervisor_ip, &hypervisor_port) {
-                Ok(config) => config,
-                Err(error) => {
-                    record_limiter_error(format!("failed to get device configs: {error}"));
+            }
+        } else if mock_shm_path().is_none() {
+            match init_production_config() {
+                Ok(config) => (config, None),
+                Err(e) => {
+                    record_limiter_error(e);
                     return;
                 }
             }
         } else {
-            let uuids = match env::var("TF_VISIBLE_DEVICES") {
-                Ok(visible_devices) => visible_devices
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect::<Vec<_>>(),
-                Err(_) => {
-                    record_limiter_error(
-                        "TF_VISIBLE_DEVICES not set in mock/test mode; skipping limiter init",
-                    );
+            match init_mock_config() {
+                Ok(config) => (config, None),
+                Err(e) => {
+                    record_limiter_error(e);
                     return;
                 }
-            };
-
-            config::PodConfig {
-                gpu_uuids: uuids,
-                isolation: None,
             }
         };
 
@@ -139,13 +223,24 @@ fn init_limiter() {
         // #[ctor] initializes the HIP runtime (via hipGetDeviceCount) before we could set
         // it, and HIP only reads HIP_VISIBLE_DEVICES at first initialization.
 
-        let limiter = match Limiter::new(config.gpu_uuids, config.isolation) {
+        let is_standalone = standalone_shm.is_some();
+
+        let limiter = match Limiter::new(config.gpu_uuids, config.isolation, is_standalone) {
             Ok(limiter) => limiter,
             Err(error) => {
                 record_limiter_error(format!("failed to initialize limiter: {error}"));
                 return;
             }
         };
+
+        // In standalone mode, eagerly inject the SHM handle we just created
+        // (in other modes, SHM is lazily opened on first hook invocation)
+        if let Some(shm_handle) = standalone_shm {
+            if let Err(e) = limiter.set_shared_memory_handle(shm_handle) {
+                record_limiter_error(format!("failed to set SHM handle: {e}"));
+                return;
+            }
+        }
 
         if GLOBAL_LIMITER.set(limiter).is_err() {
             record_limiter_error("GLOBAL_LIMITER already initialized");
@@ -208,7 +303,7 @@ fn init_hooks() {
     };
 
     let isolation = limiter.isolation();
-    let should_skip_isolation = isolation.is_some_and(|iso| iso != "soft");
+    let should_skip_isolation = isolation.is_some_and(|iso| iso != limiter::ISOLATION_SOFT);
 
     if should_skip_isolation {
         tracing::info!(
