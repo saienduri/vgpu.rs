@@ -24,6 +24,7 @@ HIP_SUCCESS = 0
 HIP_ERROR_INVALID_VALUE = 1
 HIP_ERROR_OUT_OF_MEMORY = 2
 HIP_ERROR_NOT_INITIALIZED = 3
+HIP_ERROR_NOT_SUPPORTED = 801
 
 # ── Virtual memory management types ──
 
@@ -97,6 +98,25 @@ class HIPExtent(ctypes.Structure):
         ("height", c_size_t),
         ("depth", c_size_t),
     ]
+
+
+# --- Array descriptor structs ---
+
+# hipChannelFormatDesc — Runtime API channel format descriptor.
+# Fields x/y/z/w are bit widths per channel.
+HIP_AD_FORMAT_UNSIGNED_INT8 = 0x01
+HIP_AD_FORMAT_FLOAT = 0x20
+
+class HipChannelFormatDesc(Structure):
+    _fields_ = [("x", c_int), ("y", c_int), ("z", c_int), ("w", c_int), ("f", c_int)]
+
+class HipArrayDescriptor(Structure):
+    _fields_ = [("Width", c_size_t), ("Height", c_size_t),
+                ("Format", c_int), ("NumChannels", c_uint)]
+
+class HipArray3DDescriptor(Structure):
+    _fields_ = [("Width", c_size_t), ("Height", c_size_t), ("Depth", c_size_t),
+                ("Format", c_int), ("NumChannels", c_uint), ("Flags", c_uint)]
 
 
 def _default_hip_lib_path() -> str:
@@ -230,6 +250,22 @@ class HIPRuntime:
         # hipError_t hipMalloc3D(hipPitchedPtr* pitchedDevPtr, hipExtent extent)
         lib.hipMalloc3D.restype = c_int
         lib.hipMalloc3D.argtypes = [POINTER(HIPPitchedPtr), HIPExtent]
+
+        # --- Array allocation prototypes ---
+        lib.hipMallocArray.restype = c_int
+        lib.hipMallocArray.argtypes = [POINTER(c_void_p), POINTER(HipChannelFormatDesc),
+                                       c_size_t, c_size_t, c_uint]
+        lib.hipMalloc3DArray.restype = c_int
+        lib.hipMalloc3DArray.argtypes = [POINTER(c_void_p), POINTER(HipChannelFormatDesc),
+                                         HIPExtent, c_uint]
+        lib.hipArrayCreate.restype = c_int
+        lib.hipArrayCreate.argtypes = [POINTER(c_void_p), POINTER(HipArrayDescriptor)]
+        lib.hipArray3DCreate.restype = c_int
+        lib.hipArray3DCreate.argtypes = [POINTER(c_void_p), POINTER(HipArray3DDescriptor)]
+        lib.hipFreeArray.restype = c_int
+        lib.hipFreeArray.argtypes = [c_void_p]
+        lib.hipArrayDestroy.restype = c_int
+        lib.hipArrayDestroy.argtypes = [c_void_p]
 
     def _check(self, result: int, api_name: str) -> int:
         """Check a HIP API return code and raise HIPError if non-zero."""
@@ -493,3 +529,63 @@ class HIPRuntime:
             "hipDeviceTotalMem",
         )
         return total.value
+
+    # --- Array allocation wrappers ---
+
+    def malloc_array(self, width: int, height: int = 0,
+                     desc_x: int = 32, desc_y: int = 0, desc_z: int = 0, desc_w: int = 0,
+                     flags: int = 0) -> int:
+        """Allocate a HIP array. Returns hipArray_t handle."""
+        array = c_void_p(0)
+        desc = HipChannelFormatDesc(x=desc_x, y=desc_y, z=desc_z, w=desc_w, f=2)  # f=2 = float
+        self._check(
+            self._lib.hipMallocArray(byref(array), byref(desc), width, height, flags),
+            "hipMallocArray",
+        )
+        return array.value or 0
+
+    def malloc_3d_array(self, width: int, height: int, depth: int,
+                        desc_x: int = 32, desc_y: int = 0, desc_z: int = 0, desc_w: int = 0,
+                        flags: int = 0) -> int:
+        """Allocate a 3D HIP array. Returns hipArray_t handle."""
+        array = c_void_p(0)
+        desc = HipChannelFormatDesc(x=desc_x, y=desc_y, z=desc_z, w=desc_w, f=2)
+        extent = HIPExtent(width=width, height=height, depth=depth)
+        self._check(
+            self._lib.hipMalloc3DArray(byref(array), byref(desc), extent, flags),
+            "hipMalloc3DArray",
+        )
+        return array.value or 0
+
+    def array_create(self, width: int, height: int = 0,
+                     fmt: int = HIP_AD_FORMAT_FLOAT, num_channels: int = 1) -> int:
+        """Create a HIP array via driver API. Returns hipArray_t handle."""
+        array = c_void_p(0)
+        desc = HipArrayDescriptor(Width=width, Height=height,
+                                  Format=fmt, NumChannels=num_channels)
+        self._check(
+            self._lib.hipArrayCreate(byref(array), byref(desc)),
+            "hipArrayCreate",
+        )
+        return array.value or 0
+
+    def array_3d_create(self, width: int, height: int, depth: int,
+                        fmt: int = HIP_AD_FORMAT_FLOAT, num_channels: int = 1,
+                        flags: int = 0) -> int:
+        """Create a 3D HIP array via driver API. Returns hipArray_t handle."""
+        array = c_void_p(0)
+        desc = HipArray3DDescriptor(Width=width, Height=height, Depth=depth,
+                                    Format=fmt, NumChannels=num_channels, Flags=flags)
+        self._check(
+            self._lib.hipArray3DCreate(byref(array), byref(desc)),
+            "hipArray3DCreate",
+        )
+        return array.value or 0
+
+    def free_array(self, array: int) -> None:
+        """Free a HIP array via hipFreeArray."""
+        self._check(self._lib.hipFreeArray(c_void_p(array)), "hipFreeArray")
+
+    def array_destroy(self, array: int) -> None:
+        """Destroy a HIP array via hipArrayDestroy (driver API)."""
+        self._check(self._lib.hipArrayDestroy(c_void_p(array)), "hipArrayDestroy")

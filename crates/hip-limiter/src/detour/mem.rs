@@ -1,11 +1,11 @@
-use std::ffi::{c_uint, c_ulonglong, c_void};
+use std::ffi::{c_int, c_uint, c_ulonglong, c_void};
 
 use tf_macro::hook_fn;
 use utils::hooks::HookManager;
 use utils::replace_symbol;
 
-use crate::hiplib::{HipDevice, HipError, HipMemPool, HipStream, HIP_ERROR_OUT_OF_MEMORY,
-                    HIP_ERROR_UNKNOWN, HIP_SUCCESS};
+use crate::hiplib::{HipDevice, HipError, HipMemPool, HipStream, HIP_ERROR_INVALID_VALUE,
+                    HIP_ERROR_OUT_OF_MEMORY, HIP_ERROR_UNKNOWN, HIP_SUCCESS};
 use crate::limiter::Error;
 use crate::with_device;
 use crate::GLOBAL_LIMITER;
@@ -29,6 +29,43 @@ pub struct HipExtent {
     pub width: usize,
     pub height: usize,
     pub depth: usize,
+}
+
+/// hipChannelFormatDesc — Runtime API channel format descriptor.
+/// Fields x/y/z/w are bit widths per channel; f is hipChannelFormatKind (unused for sizing).
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+pub struct HipChannelFormatDesc {
+    pub x: c_int,
+    pub y: c_int,
+    pub z: c_int,
+    pub w: c_int,
+    pub f: c_int,
+}
+
+/// HIP_ARRAY_DESCRIPTOR — Driver API 2D array descriptor.
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+pub struct HipArrayDescriptor {
+    pub width: usize,
+    pub height: usize,
+    pub format: c_int,
+    pub num_channels: c_uint,
+}
+
+/// HIP_ARRAY3D_DESCRIPTOR — Driver API 3D array descriptor.
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+pub struct HipArray3DDescriptor {
+    pub width: usize,
+    pub height: usize,
+    pub depth: usize,
+    pub format: c_int,
+    pub num_channels: c_uint,
+    pub flags: c_uint,
 }
 
 /// Map a reserve error to a HIP error code.
@@ -200,6 +237,55 @@ fn checked_pitched_size(dims: &[usize]) -> Option<u64> {
     } else {
         None
     }
+}
+
+/// Bytes per element for a `hipArray_Format` enum value.
+/// Returns `None` for unrecognized format values.
+fn array_format_bytes(format: c_int) -> Option<u64> {
+    match format {
+        0x01 | 0x08 => Some(1), // UNSIGNED_INT8, SIGNED_INT8
+        0x02 | 0x09 | 0x10 => Some(2), // UNSIGNED_INT16, SIGNED_INT16, HALF
+        0x03 | 0x0a | 0x20 => Some(4), // UNSIGNED_INT32, SIGNED_INT32, FLOAT
+        _ => None,
+    }
+}
+
+/// Compute allocation size for runtime API array descriptors (hipChannelFormatDesc).
+/// Returns `None` on non-byte-aligned bits, zero total bits, overflow, or size > u64::MAX/2.
+fn channel_desc_alloc_size(
+    desc: &HipChannelFormatDesc, width: usize, height: usize, depth: usize,
+) -> Option<u64> {
+    if desc.x < 0 || desc.y < 0 || desc.z < 0 || desc.w < 0 {
+        return None;
+    }
+    let total_bits = (desc.x as u64) + (desc.y as u64) + (desc.z as u64) + (desc.w as u64);
+    if total_bits == 0 || total_bits % 8 != 0 {
+        return None;
+    }
+    let bytes_per_elem = total_bits / 8;
+    let h = if height == 0 { 1usize } else { height };
+    let d = if depth == 0 { 1usize } else { depth };
+    let size = bytes_per_elem
+        .checked_mul(width as u64)?
+        .checked_mul(h as u64)?
+        .checked_mul(d as u64)?;
+    if size <= u64::MAX / 2 { Some(size) } else { None }
+}
+
+/// Compute allocation size for driver API array descriptors (HIP_ARRAY_DESCRIPTOR / HIP_ARRAY3D_DESCRIPTOR).
+/// Returns `None` on unknown format, overflow, or size > u64::MAX/2.
+fn driver_array_alloc_size(
+    format: c_int, num_channels: c_uint, width: usize, height: usize, depth: usize,
+) -> Option<u64> {
+    let elem_bytes = array_format_bytes(format)?;
+    let h = if height == 0 { 1usize } else { height };
+    let d = if depth == 0 { 1usize } else { depth };
+    let size = elem_bytes
+        .checked_mul(num_channels as u64)?
+        .checked_mul(width as u64)?
+        .checked_mul(h as u64)?
+        .checked_mul(d as u64)?;
+    if size <= u64::MAX / 2 { Some(size) } else { None }
 }
 
 // --- Allocation hooks ---
@@ -462,6 +548,92 @@ pub(crate) unsafe extern "C" fn hip_mem_release_detour(
     check_and_free!(handle, FN_HIP_MEM_RELEASE(handle))
 }
 
+// --- Array allocation hooks ---
+//
+// Array allocs use descriptor structs instead of explicit size parameters.
+// We compute the size from the descriptor and feed it into check_and_alloc!.
+// hipArray_t is an opaque pointer (host-heap), stored in the same DashMap as
+// device pointers — keyspaces don't collide.
+
+#[hook_fn]
+pub(crate) unsafe extern "C" fn hip_malloc_array_detour(
+    array: *mut *mut c_void, // hipArray_t*
+    desc: *const HipChannelFormatDesc,
+    width: usize,
+    height: usize,
+    flags: c_uint,
+) -> HipError {
+    let Some(request_size) = channel_desc_alloc_size(&*desc, width, height, 0) else {
+        tracing::error!("hipMallocArray: invalid channel format descriptor");
+        return HIP_ERROR_INVALID_VALUE;
+    };
+    check_and_alloc!(array, request_size, "hipMallocArray", || {
+        FN_HIP_MALLOC_ARRAY(array, desc, width, height, flags)
+    })
+}
+
+#[hook_fn]
+pub(crate) unsafe extern "C" fn hip_malloc_3d_array_detour(
+    array: *mut *mut c_void, // hipArray_t*
+    desc: *const HipChannelFormatDesc,
+    extent: HipExtent,
+    flags: c_uint,
+) -> HipError {
+    let Some(request_size) = channel_desc_alloc_size(&*desc, extent.width, extent.height, extent.depth) else {
+        tracing::error!("hipMalloc3DArray: invalid channel format descriptor");
+        return HIP_ERROR_INVALID_VALUE;
+    };
+    check_and_alloc!(array, request_size, "hipMalloc3DArray", || {
+        FN_HIP_MALLOC_3D_ARRAY(array, desc, extent, flags)
+    })
+}
+
+#[hook_fn]
+pub(crate) unsafe extern "C" fn hip_array_create_detour(
+    array: *mut *mut c_void, // hipArray_t*
+    desc: *const HipArrayDescriptor,
+) -> HipError {
+    let d = &*desc;
+    let Some(request_size) = driver_array_alloc_size(d.format, d.num_channels, d.width, d.height, 0) else {
+        tracing::error!("hipArrayCreate: invalid array descriptor (format=0x{:x})", d.format);
+        return HIP_ERROR_INVALID_VALUE;
+    };
+    check_and_alloc!(array, request_size, "hipArrayCreate", || {
+        FN_HIP_ARRAY_CREATE(array, desc)
+    })
+}
+
+#[hook_fn]
+pub(crate) unsafe extern "C" fn hip_array_3d_create_detour(
+    array: *mut *mut c_void, // hipArray_t*
+    desc: *const HipArray3DDescriptor,
+) -> HipError {
+    let d = &*desc;
+    let Some(request_size) = driver_array_alloc_size(d.format, d.num_channels, d.width, d.height, d.depth) else {
+        tracing::error!("hipArray3DCreate: invalid 3D array descriptor (format=0x{:x})", d.format);
+        return HIP_ERROR_INVALID_VALUE;
+    };
+    check_and_alloc!(array, request_size, "hipArray3DCreate", || {
+        FN_HIP_ARRAY_3D_CREATE(array, desc)
+    })
+}
+
+// --- Array free hooks ---
+
+#[hook_fn]
+pub(crate) unsafe extern "C" fn hip_free_array_detour(
+    array: *mut c_void, // hipArray_t
+) -> HipError {
+    check_and_free!(array, FN_HIP_FREE_ARRAY(array))
+}
+
+#[hook_fn]
+pub(crate) unsafe extern "C" fn hip_array_destroy_detour(
+    array: *mut c_void, // hipArray_t
+) -> HipError {
+    check_and_free!(array, FN_HIP_ARRAY_DESTROY(array))
+}
+
 // --- Info spoofing hooks ---
 
 #[hook_fn]
@@ -669,6 +841,56 @@ pub(crate) unsafe fn enable_hooks(hook_manager: &mut HookManager) -> Result<(), 
         FnHip_malloc_3d,
         FN_HIP_MALLOC_3D
     )?;
+    // --- Array free hooks (registered before array alloc hooks for consistency) ---
+    replace_symbol!(
+        hook_manager,
+        Some("libamdhip64."),
+        "hipFreeArray",
+        hip_free_array_detour,
+        FnHip_free_array,
+        FN_HIP_FREE_ARRAY
+    )?;
+    replace_symbol!(
+        hook_manager,
+        Some("libamdhip64."),
+        "hipArrayDestroy",
+        hip_array_destroy_detour,
+        FnHip_array_destroy,
+        FN_HIP_ARRAY_DESTROY
+    )?;
+    // --- Array alloc hooks ---
+    replace_symbol!(
+        hook_manager,
+        Some("libamdhip64."),
+        "hipMallocArray",
+        hip_malloc_array_detour,
+        FnHip_malloc_array,
+        FN_HIP_MALLOC_ARRAY
+    )?;
+    replace_symbol!(
+        hook_manager,
+        Some("libamdhip64."),
+        "hipMalloc3DArray",
+        hip_malloc_3d_array_detour,
+        FnHip_malloc_3d_array,
+        FN_HIP_MALLOC_3D_ARRAY
+    )?;
+    replace_symbol!(
+        hook_manager,
+        Some("libamdhip64."),
+        "hipArrayCreate",
+        hip_array_create_detour,
+        FnHip_array_create,
+        FN_HIP_ARRAY_CREATE
+    )?;
+    replace_symbol!(
+        hook_manager,
+        Some("libamdhip64."),
+        "hipArray3DCreate",
+        hip_array_3d_create_detour,
+        FnHip_array_3d_create,
+        FN_HIP_ARRAY_3D_CREATE
+    )?;
     replace_symbol!(
         hook_manager,
         Some("libamdhip64."),
@@ -687,4 +909,148 @@ pub(crate) unsafe fn enable_hooks(hook_manager: &mut HookManager) -> Result<(), 
     )?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- array_format_bytes ---
+
+    #[test]
+    fn test_format_bytes_unsigned_int8() {
+        assert_eq!(array_format_bytes(0x01), Some(1));
+    }
+
+    #[test]
+    fn test_format_bytes_unsigned_int16() {
+        assert_eq!(array_format_bytes(0x02), Some(2));
+    }
+
+    #[test]
+    fn test_format_bytes_unsigned_int32() {
+        assert_eq!(array_format_bytes(0x03), Some(4));
+    }
+
+    #[test]
+    fn test_format_bytes_signed_int8() {
+        assert_eq!(array_format_bytes(0x08), Some(1));
+    }
+
+    #[test]
+    fn test_format_bytes_signed_int16() {
+        assert_eq!(array_format_bytes(0x09), Some(2));
+    }
+
+    #[test]
+    fn test_format_bytes_signed_int32() {
+        assert_eq!(array_format_bytes(0x0a), Some(4));
+    }
+
+    #[test]
+    fn test_format_bytes_half() {
+        assert_eq!(array_format_bytes(0x10), Some(2));
+    }
+
+    #[test]
+    fn test_format_bytes_float() {
+        assert_eq!(array_format_bytes(0x20), Some(4));
+    }
+
+    #[test]
+    fn test_format_bytes_unknown() {
+        assert_eq!(array_format_bytes(0x00), None);
+        assert_eq!(array_format_bytes(0x04), None);
+        assert_eq!(array_format_bytes(0xFF), None);
+    }
+
+    // --- channel_desc_alloc_size ---
+
+    fn make_desc(x: i32, y: i32, z: i32, w: i32) -> HipChannelFormatDesc {
+        HipChannelFormatDesc { x: x as c_int, y: y as c_int, z: z as c_int, w: w as c_int, f: 0 }
+    }
+
+    #[test]
+    fn test_channel_desc_rgba_float_2d() {
+        // 4 channels x 32 bits = 16 bytes/elem, 256x256
+        let desc = make_desc(32, 32, 32, 32);
+        assert_eq!(channel_desc_alloc_size(&desc, 256, 256, 0), Some(16 * 256 * 256));
+    }
+
+    #[test]
+    fn test_channel_desc_single_u8_2d() {
+        let desc = make_desc(8, 0, 0, 0);
+        assert_eq!(channel_desc_alloc_size(&desc, 1024, 512, 0), Some(1024 * 512));
+    }
+
+    #[test]
+    fn test_channel_desc_1d_height_zero() {
+        let desc = make_desc(32, 0, 0, 0);
+        assert_eq!(channel_desc_alloc_size(&desc, 1000, 0, 0), Some(4 * 1000));
+    }
+
+    #[test]
+    fn test_channel_desc_zero_width() {
+        let desc = make_desc(8, 0, 0, 0);
+        assert_eq!(channel_desc_alloc_size(&desc, 0, 100, 0), Some(0));
+    }
+
+    #[test]
+    fn test_channel_desc_non_byte_aligned() {
+        let desc = make_desc(7, 0, 0, 0);
+        assert_eq!(channel_desc_alloc_size(&desc, 100, 100, 0), None);
+    }
+
+    #[test]
+    fn test_channel_desc_zero_bits() {
+        let desc = make_desc(0, 0, 0, 0);
+        assert_eq!(channel_desc_alloc_size(&desc, 100, 100, 0), None);
+    }
+
+    #[test]
+    fn test_channel_desc_overflow() {
+        let desc = make_desc(32, 0, 0, 0);
+        assert_eq!(channel_desc_alloc_size(&desc, usize::MAX, 2, 0), None);
+    }
+
+    #[test]
+    fn test_channel_desc_3d() {
+        let desc = make_desc(32, 0, 0, 0);
+        // 4 bytes * 64 * 64 * 64 = 1 MiB
+        assert_eq!(channel_desc_alloc_size(&desc, 64, 64, 64), Some(4 * 64 * 64 * 64));
+    }
+
+    #[test]
+    fn test_channel_desc_negative_bits() {
+        assert_eq!(channel_desc_alloc_size(&make_desc(-8, 16, 0, 0), 100, 100, 0), None);
+    }
+
+    // --- driver_array_alloc_size ---
+
+    #[test]
+    fn test_driver_2ch_float_2d() {
+        // FLOAT=0x20 (4 bytes) * 2 channels * 512 * 512 = 2 MiB
+        assert_eq!(driver_array_alloc_size(0x20, 2, 512, 512, 0), Some(4 * 2 * 512 * 512));
+    }
+
+    #[test]
+    fn test_driver_4ch_u8_3d() {
+        // U8=0x01 (1 byte) * 4 channels * 64^3 = 1 MiB
+        assert_eq!(driver_array_alloc_size(0x01, 4, 64, 64, 64), Some(4 * 64 * 64 * 64));
+    }
+
+    #[test]
+    fn test_driver_1d_height_zero() {
+        assert_eq!(driver_array_alloc_size(0x01, 1, 1000, 0, 0), Some(1000));
+    }
+
+    #[test]
+    fn test_driver_unknown_format() {
+        assert_eq!(driver_array_alloc_size(0xFF, 1, 100, 100, 0), None);
+    }
+
+    #[test]
+    fn test_driver_overflow() {
+        assert_eq!(driver_array_alloc_size(0x20, 4, usize::MAX, 2, 0), None);
+    }
 }

@@ -299,3 +299,76 @@ def test_free_untracked_ptr(cts):
     """)
     assert result.succeeded, f"Subprocess failed: {result.stderr}"
     assert "PASS" in result.stdout, f"Untracked free test failed: {result.stdout}"
+
+
+# --- Array free tracking (parametrized) ---
+#
+# HIP array APIs (hipMallocArray etc.) return hipErrorNotSupported (801) on some
+# GPUs (e.g., MI325X/gfx942). Tests skip gracefully when the platform lacks support.
+
+_ARRAY_FREE_TRACKING_CASES = [
+    ("hipMallocArray+hipFreeArray",
+     "hip.malloc_array(width=256, height=256, desc_x=32)",
+     "hip.free_array(arr)",
+     "4 * 256 * 256"),
+    ("hipArrayCreate+hipArrayDestroy",
+     "hip.array_create(width=256, height=256, fmt=HIP_AD_FORMAT_FLOAT, num_channels=1)",
+     "hip.array_destroy(arr)",
+     "4 * 1 * 256 * 256"),
+    ("hipMallocArray+hipArrayDestroy",
+     "hip.malloc_array(width=256, height=256, desc_x=32)",
+     "hip.array_destroy(arr)",
+     "4 * 256 * 256"),
+    ("hipMalloc3DArray+hipFreeArray",
+     "hip.malloc_3d_array(width=64, height=64, depth=4, desc_x=32)",
+     "hip.free_array(arr)",
+     "4 * 64 * 64 * 4"),
+    ("hipArray3DCreate+hipArrayDestroy",
+     "hip.array_3d_create(width=64, height=64, depth=4, fmt=HIP_AD_FORMAT_FLOAT, num_channels=1)",
+     "hip.array_destroy(arr)",
+     "4 * 1 * 64 * 64 * 4"),
+]
+
+
+@pytest.mark.parametrize(
+    "alloc_call,free_call,expected_expr",
+    [(a, f, e) for _, a, f, e in _ARRAY_FREE_TRACKING_CASES],
+    ids=[tid for tid, _, _, _ in _ARRAY_FREE_TRACKING_CASES],
+)
+def test_array_free_tracking(cts, alloc_call, free_call, expected_expr):
+    """Array alloc/free pairs should return pod_memory_used to zero."""
+    result = cts.run_hip_test(f"""\
+        import os
+        from hip_helper import HIPRuntime, HIPError, HIP_AD_FORMAT_FLOAT, HIP_ERROR_NOT_SUPPORTED
+        from shm_writer import read_pod_memory_used
+
+        hip = HIPRuntime()
+        shm_path = os.environ["TF_SHM_FILE"]
+
+        used_before = read_pod_memory_used(shm_path, 0)
+        try:
+            arr = {alloc_call}
+        except HIPError as e:
+            if e.error_code == HIP_ERROR_NOT_SUPPORTED:
+                print("NOT_SUPPORTED")
+                raise SystemExit(0)
+            raise
+        used_after_alloc = read_pod_memory_used(shm_path, 0)
+        {free_call}
+        used_after_free = read_pod_memory_used(shm_path, 0)
+
+        expected = {expected_expr}
+
+        print(f"delta_alloc={{used_after_alloc - used_before}}")
+        print(f"expected={{expected}}")
+        print(f"after_free={{used_after_free}}")
+
+        if used_after_alloc - used_before == expected and used_after_free == used_before:
+            print("PASS")
+        else:
+            print(f"FAIL: delta={{used_after_alloc - used_before}} expected={{expected}} after_free={{used_after_free}} before={{used_before}}")
+    """)
+    if "NOT_SUPPORTED" in result.stdout:
+        pytest.skip("Array API not supported on this GPU")
+    assert result.succeeded, f"Subprocess failed: {result.stderr}"
+    assert "PASS" in result.stdout, f"Array free tracking failed: {result.stdout}"

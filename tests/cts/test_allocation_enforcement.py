@@ -256,6 +256,58 @@ handle = hip.mem_create(size, 0)
 print("ALLOC_OK")
 hip.mem_release(handle)
 """,
+    "hipMallocArray": """\
+from hip_helper import HIPRuntime, HIPError, HIP_ERROR_NOT_SUPPORTED
+hip = HIPRuntime()
+try:
+    arr = hip.malloc_array(width=256, height=256, desc_x=32)
+    print("ALLOC_OK")
+    hip.free_array(arr)
+except HIPError as e:
+    if e.error_code == HIP_ERROR_NOT_SUPPORTED:
+        print("NOT_SUPPORTED")
+    else:
+        raise
+""",
+    "hipMalloc3DArray": """\
+from hip_helper import HIPRuntime, HIPError, HIP_ERROR_NOT_SUPPORTED
+hip = HIPRuntime()
+try:
+    arr = hip.malloc_3d_array(width=64, height=64, depth=64, desc_x=32)
+    print("ALLOC_OK")
+    hip.free_array(arr)
+except HIPError as e:
+    if e.error_code == HIP_ERROR_NOT_SUPPORTED:
+        print("NOT_SUPPORTED")
+    else:
+        raise
+""",
+    "hipArrayCreate": """\
+from hip_helper import HIPRuntime, HIPError, HIP_AD_FORMAT_FLOAT, HIP_ERROR_NOT_SUPPORTED
+hip = HIPRuntime()
+try:
+    arr = hip.array_create(width=256, height=256, fmt=HIP_AD_FORMAT_FLOAT, num_channels=1)
+    print("ALLOC_OK")
+    hip.array_destroy(arr)
+except HIPError as e:
+    if e.error_code == HIP_ERROR_NOT_SUPPORTED:
+        print("NOT_SUPPORTED")
+    else:
+        raise
+""",
+    "hipArray3DCreate": """\
+from hip_helper import HIPRuntime, HIPError, HIP_AD_FORMAT_FLOAT, HIP_ERROR_NOT_SUPPORTED
+hip = HIPRuntime()
+try:
+    arr = hip.array_3d_create(width=64, height=64, depth=64, fmt=HIP_AD_FORMAT_FLOAT, num_channels=1)
+    print("ALLOC_OK")
+    hip.array_destroy(arr)
+except HIPError as e:
+    if e.error_code == HIP_ERROR_NOT_SUPPORTED:
+        print("NOT_SUPPORTED")
+    else:
+        raise
+""",
 }
 
 
@@ -268,6 +320,8 @@ def test_each_alloc_variant(cts, variant):
     """
     result = cts.run_hip_test(ALLOC_VARIANT_SCRIPTS[variant])
     assert result.succeeded, f"Subprocess failed for {variant}: {result.stderr}"
+    if "NOT_SUPPORTED" in result.stdout:
+        pytest.skip(f"{variant} not supported on this GPU")
     assert "ALLOC_OK" in result.stdout, f"{variant} allocation failed: {result.stdout}"
 
 
@@ -796,6 +850,18 @@ hip.free(fill_ptr)
             "    handle = hip.mem_create(aligned, 0)",
             "hip.mem_release(handle)",
             preamble="granularity = hip.get_allocation_granularity(0)"),
+        "hipMallocArray": _oom_script(
+            "arr = hip.malloc_array(width=over_size // 4, height=1, desc_x=32)",
+            "hip.free_array(arr)"),
+        "hipMalloc3DArray": _oom_script(
+            "arr = hip.malloc_3d_array(width=over_size // 4, height=1, depth=1, desc_x=32)",
+            "hip.free_array(arr)"),
+        "hipArrayCreate": _oom_script(
+            "arr = hip.array_create(width=over_size // 4, height=1)",
+            "hip.array_destroy(arr)"),
+        "hipArray3DCreate": _oom_script(
+            "arr = hip.array_3d_create(width=over_size // 4, height=1, depth=1)",
+            "hip.array_destroy(arr)"),
     }
 
     @pytest.mark.parametrize("variant", list(VARIANT_SCRIPTS.keys()))
@@ -813,6 +879,8 @@ hip.free(fill_ptr)
         )
         result = fixture.run_hip_test(script)
         assert result.succeeded, f"Subprocess failed for {variant}: {result.stderr}"
+        if "UNEXPECTED=801" in result.stdout:
+            pytest.skip(f"{variant} not supported on this GPU")
         assert "DENIED" in result.stdout, (
             f"{variant} should be denied when exceeding limit, got: {result.stdout}"
         )

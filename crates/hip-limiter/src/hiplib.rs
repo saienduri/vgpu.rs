@@ -8,6 +8,7 @@ pub type HipStream = *mut c_void;
 pub type HipMemPool = *mut c_void;
 
 pub const HIP_SUCCESS: HipError = 0;
+pub const HIP_ERROR_INVALID_VALUE: HipError = 1;
 pub const HIP_ERROR_OUT_OF_MEMORY: HipError = 2;
 pub const HIP_ERROR_UNKNOWN: HipError = 999;
 
