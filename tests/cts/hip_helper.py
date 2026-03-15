@@ -266,6 +266,16 @@ class HIPRuntime:
         lib.hipFreeArray.argtypes = [c_void_p]
         lib.hipArrayDestroy.restype = c_int
         lib.hipArrayDestroy.argtypes = [c_void_p]
+        lib.hipMallocMipmappedArray.restype = c_int
+        lib.hipMallocMipmappedArray.argtypes = [POINTER(c_void_p), POINTER(HipChannelFormatDesc),
+                                                 HIPExtent, c_uint, c_uint]
+        lib.hipMipmappedArrayCreate.restype = c_int
+        lib.hipMipmappedArrayCreate.argtypes = [POINTER(c_void_p), POINTER(HipArray3DDescriptor),
+                                                 c_uint]
+        lib.hipFreeMipmappedArray.restype = c_int
+        lib.hipFreeMipmappedArray.argtypes = [c_void_p]
+        lib.hipMipmappedArrayDestroy.restype = c_int
+        lib.hipMipmappedArrayDestroy.argtypes = [c_void_p]
 
     def _check(self, result: int, api_name: str) -> int:
         """Check a HIP API return code and raise HIPError if non-zero."""
@@ -589,3 +599,42 @@ class HIPRuntime:
     def array_destroy(self, array: int) -> None:
         """Destroy a HIP array via hipArrayDestroy (driver API)."""
         self._check(self._lib.hipArrayDestroy(c_void_p(array)), "hipArrayDestroy")
+
+    # --- Mipmapped array allocation wrappers ---
+
+    def malloc_mipmapped_array(self, width: int, height: int = 0, depth: int = 0,
+                                num_levels: int = 1,
+                                desc_x: int = 32, desc_y: int = 0,
+                                desc_z: int = 0, desc_w: int = 0,
+                                flags: int = 0) -> int:
+        """Allocate a mipmapped HIP array. Returns hipMipmappedArray_t handle."""
+        array = c_void_p(0)
+        desc = HipChannelFormatDesc(x=desc_x, y=desc_y, z=desc_z, w=desc_w, f=2)
+        extent = HIPExtent(width=width, height=height, depth=depth)
+        self._check(
+            self._lib.hipMallocMipmappedArray(byref(array), byref(desc), extent, num_levels, flags),
+            "hipMallocMipmappedArray",
+        )
+        return array.value or 0
+
+    def mipmapped_array_create(self, width: int, height: int = 0, depth: int = 0,
+                                num_levels: int = 1,
+                                fmt: int = HIP_AD_FORMAT_FLOAT, num_channels: int = 1,
+                                flags: int = 0) -> int:
+        """Create a mipmapped HIP array via driver API. Returns hipMipmappedArray_t handle."""
+        array = c_void_p(0)
+        desc = HipArray3DDescriptor(Width=width, Height=height, Depth=depth,
+                                    Format=fmt, NumChannels=num_channels, Flags=flags)
+        self._check(
+            self._lib.hipMipmappedArrayCreate(byref(array), byref(desc), num_levels),
+            "hipMipmappedArrayCreate",
+        )
+        return array.value or 0
+
+    def free_mipmapped_array(self, array: int) -> None:
+        """Free a mipmapped HIP array via hipFreeMipmappedArray."""
+        self._check(self._lib.hipFreeMipmappedArray(c_void_p(array)), "hipFreeMipmappedArray")
+
+    def mipmapped_array_destroy(self, array: int) -> None:
+        """Destroy a mipmapped HIP array via hipMipmappedArrayDestroy (driver API)."""
+        self._check(self._lib.hipMipmappedArrayDestroy(c_void_p(array)), "hipMipmappedArrayDestroy")

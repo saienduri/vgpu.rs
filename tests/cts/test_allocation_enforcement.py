@@ -308,6 +308,32 @@ except HIPError as e:
     else:
         raise
 """,
+    "hipMallocMipmappedArray": """\
+from hip_helper import HIPRuntime, HIPError, HIP_ERROR_NOT_SUPPORTED
+hip = HIPRuntime()
+try:
+    arr = hip.malloc_mipmapped_array(width=256, height=256, num_levels=4, desc_x=32)
+    print("ALLOC_OK")
+    hip.free_mipmapped_array(arr)
+except HIPError as e:
+    if e.error_code == HIP_ERROR_NOT_SUPPORTED:
+        print("NOT_SUPPORTED")
+    else:
+        raise
+""",
+    "hipMipmappedArrayCreate": """\
+from hip_helper import HIPRuntime, HIPError, HIP_AD_FORMAT_FLOAT, HIP_ERROR_NOT_SUPPORTED
+hip = HIPRuntime()
+try:
+    arr = hip.mipmapped_array_create(width=256, height=256, num_levels=4, fmt=HIP_AD_FORMAT_FLOAT, num_channels=1)
+    print("ALLOC_OK")
+    hip.mipmapped_array_destroy(arr)
+except HIPError as e:
+    if e.error_code == HIP_ERROR_NOT_SUPPORTED:
+        print("NOT_SUPPORTED")
+    else:
+        raise
+""",
 }
 
 
@@ -862,6 +888,12 @@ hip.free(fill_ptr)
         "hipArray3DCreate": _oom_script(
             "arr = hip.array_3d_create(width=over_size // 4, height=1, depth=1)",
             "hip.array_destroy(arr)"),
+        "hipMallocMipmappedArray": _oom_script(
+            "arr = hip.malloc_mipmapped_array(width=over_size // 4, height=1, num_levels=1, desc_x=32)",
+            "hip.free_mipmapped_array(arr)"),
+        "hipMipmappedArrayCreate": _oom_script(
+            "arr = hip.mipmapped_array_create(width=over_size // 4, height=1, num_levels=1)",
+            "hip.mipmapped_array_destroy(arr)"),
     }
 
     @pytest.mark.parametrize("variant", list(VARIANT_SCRIPTS.keys()))

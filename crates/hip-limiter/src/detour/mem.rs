@@ -250,11 +250,9 @@ fn array_format_bytes(format: c_int) -> Option<u64> {
     }
 }
 
-/// Compute allocation size for runtime API array descriptors (hipChannelFormatDesc).
-/// Returns `None` on non-byte-aligned bits, zero total bits, overflow, or size > u64::MAX/2.
-fn channel_desc_alloc_size(
-    desc: &HipChannelFormatDesc, width: usize, height: usize, depth: usize,
-) -> Option<u64> {
+/// Bytes per element from a `hipChannelFormatDesc` (sum of x/y/z/w bit widths / 8).
+/// Returns `None` on negative widths, zero total bits, or non-byte-aligned bits.
+fn channel_desc_bytes_per_elem(desc: &HipChannelFormatDesc) -> Option<u64> {
     if desc.x < 0 || desc.y < 0 || desc.z < 0 || desc.w < 0 {
         return None;
     }
@@ -262,7 +260,15 @@ fn channel_desc_alloc_size(
     if total_bits == 0 || total_bits % 8 != 0 {
         return None;
     }
-    let bytes_per_elem = total_bits / 8;
+    Some(total_bits / 8)
+}
+
+/// Compute allocation size for runtime API array descriptors (hipChannelFormatDesc).
+/// Returns `None` on invalid descriptor, overflow, or size > u64::MAX/2.
+fn channel_desc_alloc_size(
+    desc: &HipChannelFormatDesc, width: usize, height: usize, depth: usize,
+) -> Option<u64> {
+    let bytes_per_elem = channel_desc_bytes_per_elem(desc)?;
     let h = if height == 0 { 1usize } else { height };
     let d = if depth == 0 { 1usize } else { depth };
     let size = bytes_per_elem
@@ -286,6 +292,43 @@ fn driver_array_alloc_size(
         .checked_mul(h as u64)?
         .checked_mul(d as u64)?;
     if size <= u64::MAX / 2 { Some(size) } else { None }
+}
+
+/// Compute total allocation size for a mipmapped array by summing all mip levels.
+///
+/// Each level halves each dimension (floored to 1). This is more accurate than the
+/// geometric series upper bound (2x for 1D, 4/3x for 2D, 8/7x for 3D) because it
+/// uses the actual `num_levels` and integer-floored dimensions.
+///
+/// The naive per-level formula may slightly undercount vs the driver's internal
+/// tiling/padding, but this is acceptable: mipmapped arrays are rare in ML workloads,
+/// slight undercount favors the user, and no HIP API exists to query actual consumption.
+///
+/// `num_levels` is capped at 32 to prevent pathological iteration. The maximum
+/// meaningful mip level count for the largest supported texture dimension (65536) is
+/// `floor(log2(65536)) + 1 = 17`, so 32 is generous while still bounded.
+fn mip_chain_total_size(
+    bytes_per_elem: u64, width: usize, height: usize, depth: usize, num_levels: u32,
+) -> Option<u64> {
+    const MAX_MIP_LEVELS: u32 = 32;
+    if num_levels > MAX_MIP_LEVELS {
+        return None;
+    }
+    let mut total: u64 = 0;
+    let mut w = width;
+    let mut h = if height == 0 { 1usize } else { height };
+    let mut d = if depth == 0 { 1usize } else { depth };
+    for _ in 0..num_levels {
+        let level_size = bytes_per_elem
+            .checked_mul(w as u64)?
+            .checked_mul(h as u64)?
+            .checked_mul(d as u64)?;
+        total = total.checked_add(level_size)?;
+        w = (w / 2).max(1);
+        h = (h / 2).max(1);
+        d = (d / 2).max(1);
+    }
+    if total <= u64::MAX / 2 { Some(total) } else { None }
 }
 
 // --- Allocation hooks ---
@@ -634,6 +677,78 @@ pub(crate) unsafe extern "C" fn hip_array_destroy_detour(
     check_and_free!(array, FN_HIP_ARRAY_DESTROY(array))
 }
 
+// --- Mipmapped array allocation hooks ---
+//
+// Mipmapped arrays allocate a chain of progressively smaller mip levels.
+// We sum all levels for accurate accounting (each level halves dimensions, floored to 1).
+// hipMipmappedArray_t is an opaque host-heap pointer (distinct heap allocation from the
+// HIP runtime), so its address cannot collide with device VA pointers or other handle
+// types in the shared DashMap tracker.
+
+#[hook_fn]
+pub(crate) unsafe extern "C" fn hip_malloc_mipmapped_array_detour(
+    array: *mut *mut c_void, // hipMipmappedArray_t*
+    desc: *const HipChannelFormatDesc,
+    extent: HipExtent, // passed by value
+    num_levels: c_uint,
+    flags: c_uint,
+) -> HipError {
+    let Some(bytes_per_elem) = channel_desc_bytes_per_elem(&*desc) else {
+        tracing::error!("hipMallocMipmappedArray: invalid channel format descriptor");
+        return HIP_ERROR_INVALID_VALUE;
+    };
+    let Some(request_size) = mip_chain_total_size(bytes_per_elem, extent.width, extent.height, extent.depth, num_levels) else {
+        tracing::error!("hipMallocMipmappedArray: size computation overflow");
+        return HIP_ERROR_INVALID_VALUE;
+    };
+    check_and_alloc!(array, request_size, "hipMallocMipmappedArray", || {
+        FN_HIP_MALLOC_MIPMAPPED_ARRAY(array, desc, extent, num_levels, flags)
+    })
+}
+
+#[hook_fn]
+pub(crate) unsafe extern "C" fn hip_mipmapped_array_create_detour(
+    array: *mut *mut c_void, // hipMipmappedArray_t*
+    desc: *mut HipArray3DDescriptor, // non-const pointer per HIP API
+    num_levels: c_uint,
+) -> HipError {
+    let d = &*desc;
+    let Some(elem_bytes) = array_format_bytes(d.format) else {
+        tracing::error!("hipMipmappedArrayCreate: invalid array descriptor (format=0x{:x})", d.format);
+        return HIP_ERROR_INVALID_VALUE;
+    };
+    let bytes_per_elem = match elem_bytes.checked_mul(d.num_channels as u64) {
+        Some(b) => b,
+        None => {
+            tracing::error!("hipMipmappedArrayCreate: element size overflow (format=0x{:x}, num_channels={})", d.format, d.num_channels);
+            return HIP_ERROR_INVALID_VALUE;
+        }
+    };
+    let Some(request_size) = mip_chain_total_size(bytes_per_elem, d.width, d.height, d.depth, num_levels) else {
+        tracing::error!("hipMipmappedArrayCreate: size computation overflow");
+        return HIP_ERROR_INVALID_VALUE;
+    };
+    check_and_alloc!(array, request_size, "hipMipmappedArrayCreate", || {
+        FN_HIP_MIPMAPPED_ARRAY_CREATE(array, desc, num_levels)
+    })
+}
+
+// --- Mipmapped array free hooks ---
+
+#[hook_fn]
+pub(crate) unsafe extern "C" fn hip_free_mipmapped_array_detour(
+    array: *mut c_void, // hipMipmappedArray_t
+) -> HipError {
+    check_and_free!(array, FN_HIP_FREE_MIPMAPPED_ARRAY(array))
+}
+
+#[hook_fn]
+pub(crate) unsafe extern "C" fn hip_mipmapped_array_destroy_detour(
+    array: *mut c_void, // hipMipmappedArray_t
+) -> HipError {
+    check_and_free!(array, FN_HIP_MIPMAPPED_ARRAY_DESTROY(array))
+}
+
 // --- Info spoofing hooks ---
 
 #[hook_fn]
@@ -891,6 +1006,40 @@ pub(crate) unsafe fn enable_hooks(hook_manager: &mut HookManager) -> Result<(), 
         FnHip_array_3d_create,
         FN_HIP_ARRAY_3D_CREATE
     )?;
+    // --- Mipmapped array free hooks (registered before mipmapped alloc hooks for consistency) ---
+    replace_symbol!(
+        hook_manager,
+        Some("libamdhip64."),
+        "hipFreeMipmappedArray",
+        hip_free_mipmapped_array_detour,
+        FnHip_free_mipmapped_array,
+        FN_HIP_FREE_MIPMAPPED_ARRAY
+    )?;
+    replace_symbol!(
+        hook_manager,
+        Some("libamdhip64."),
+        "hipMipmappedArrayDestroy",
+        hip_mipmapped_array_destroy_detour,
+        FnHip_mipmapped_array_destroy,
+        FN_HIP_MIPMAPPED_ARRAY_DESTROY
+    )?;
+    // --- Mipmapped array alloc hooks ---
+    replace_symbol!(
+        hook_manager,
+        Some("libamdhip64."),
+        "hipMallocMipmappedArray",
+        hip_malloc_mipmapped_array_detour,
+        FnHip_malloc_mipmapped_array,
+        FN_HIP_MALLOC_MIPMAPPED_ARRAY
+    )?;
+    replace_symbol!(
+        hook_manager,
+        Some("libamdhip64."),
+        "hipMipmappedArrayCreate",
+        hip_mipmapped_array_create_detour,
+        FnHip_mipmapped_array_create,
+        FN_HIP_MIPMAPPED_ARRAY_CREATE
+    )?;
     replace_symbol!(
         hook_manager,
         Some("libamdhip64."),
@@ -1052,5 +1201,109 @@ mod tests {
     #[test]
     fn test_driver_overflow() {
         assert_eq!(driver_array_alloc_size(0x20, 4, usize::MAX, 2, 0), None);
+    }
+
+    // --- mip_chain_total_size ---
+
+    #[test]
+    fn test_mip_single_level_equals_base() {
+        // 1 level = just the base: 4 bytes * 256 * 256 = 256 KiB
+        assert_eq!(mip_chain_total_size(4, 256, 256, 0, 1), Some(4 * 256 * 256));
+    }
+
+    #[test]
+    fn test_mip_2d_two_levels() {
+        // Level 0: 4 * 256 * 256 = 262144
+        // Level 1: 4 * 128 * 128 = 65536
+        // Total: 327680
+        assert_eq!(mip_chain_total_size(4, 256, 256, 0, 2), Some(262144 + 65536));
+    }
+
+    #[test]
+    fn test_mip_2d_full_chain() {
+        // 256x256 with 9 levels (256 -> 1x1)
+        // Sum: 4*(256*256 + 128*128 + 64*64 + 32*32 + 16*16 + 8*8 + 4*4 + 2*2 + 1*1)
+        //    = 4*(65536 + 16384 + 4096 + 1024 + 256 + 64 + 16 + 4 + 1) = 4*87381 = 349524
+        assert_eq!(mip_chain_total_size(4, 256, 256, 0, 9), Some(4 * 87381));
+    }
+
+    #[test]
+    fn test_mip_1d() {
+        // 1D: width=128, height=0 (treated as 1), 8 levels
+        // 128 + 64 + 32 + 16 + 8 + 4 + 2 + 1 = 255
+        assert_eq!(mip_chain_total_size(1, 128, 0, 0, 8), Some(255));
+    }
+
+    #[test]
+    fn test_mip_3d() {
+        // 3D: 8x8x8, 4 levels, 1 byte/elem
+        // Level 0: 8*8*8=512, Level 1: 4*4*4=64, Level 2: 2*2*2=8, Level 3: 1*1*1=1
+        assert_eq!(mip_chain_total_size(1, 8, 8, 8, 4), Some(512 + 64 + 8 + 1));
+    }
+
+    #[test]
+    fn test_mip_zero_levels() {
+        // 0 levels = no allocation
+        assert_eq!(mip_chain_total_size(4, 256, 256, 0, 0), Some(0));
+    }
+
+    #[test]
+    fn test_mip_dimensions_floor_to_one() {
+        // 3x1 2D with 3 levels: Level 0: 3*1=3, Level 1: 1*1=1, Level 2: 1*1=1
+        assert_eq!(mip_chain_total_size(1, 3, 1, 0, 3), Some(3 + 1 + 1));
+    }
+
+    #[test]
+    fn test_mip_overflow() {
+        assert_eq!(mip_chain_total_size(4, usize::MAX, 2, 0, 1), None);
+    }
+
+    #[test]
+    fn test_mip_exceeds_max_alloc() {
+        // Large but not overflow — exceeds u64::MAX / 2 guard
+        assert_eq!(mip_chain_total_size(u64::MAX / 4, 4, 1, 0, 1), None);
+    }
+
+    #[test]
+    fn test_mip_exceeds_max_levels() {
+        // num_levels > 32 is rejected
+        assert_eq!(mip_chain_total_size(4, 256, 256, 0, 33), None);
+        // 32 is the max allowed
+        assert!(mip_chain_total_size(4, 256, 256, 0, 32).is_some());
+    }
+
+    #[test]
+    fn test_mip_non_power_of_two() {
+        // 100x50, 3 levels: Level 0: 100*50=5000, Level 1: 50*25=1250, Level 2: 25*12=300
+        assert_eq!(mip_chain_total_size(1, 100, 50, 0, 3), Some(5000 + 1250 + 300));
+    }
+
+    // --- channel_desc_bytes_per_elem ---
+
+    #[test]
+    fn test_bytes_per_elem_rgba_float() {
+        let desc = make_desc(32, 32, 32, 32);
+        assert_eq!(channel_desc_bytes_per_elem(&desc), Some(16));
+    }
+
+    #[test]
+    fn test_bytes_per_elem_two_channel() {
+        let desc = make_desc(16, 16, 0, 0);
+        assert_eq!(channel_desc_bytes_per_elem(&desc), Some(4));
+    }
+
+    #[test]
+    fn test_bytes_per_elem_negative() {
+        assert_eq!(channel_desc_bytes_per_elem(&make_desc(-8, 16, 0, 0)), None);
+    }
+
+    #[test]
+    fn test_bytes_per_elem_non_byte_aligned() {
+        assert_eq!(channel_desc_bytes_per_elem(&make_desc(7, 0, 0, 0)), None);
+    }
+
+    #[test]
+    fn test_bytes_per_elem_zero() {
+        assert_eq!(channel_desc_bytes_per_elem(&make_desc(0, 0, 0, 0)), None);
     }
 }

@@ -327,6 +327,30 @@ _ARRAY_FREE_TRACKING_CASES = [
      "hip.array_3d_create(width=64, height=64, depth=4, fmt=HIP_AD_FORMAT_FLOAT, num_channels=1)",
      "hip.array_destroy(arr)",
      "4 * 1 * 64 * 64 * 4"),
+    # --- Mipmapped array pairs ---
+    # Mipmapped arrays account for the full mip chain (sum of all levels).
+    # Like regular array APIs, these return hipErrorNotSupported (801) on MI325X/gfx942.
+    ("hipMallocMipmappedArray+hipFreeMipmappedArray",
+     "hip.malloc_mipmapped_array(width=256, height=256, num_levels=1, desc_x=32)",
+     "hip.free_mipmapped_array(arr)",
+     "4 * 256 * 256"),
+    ("hipMipmappedArrayCreate+hipMipmappedArrayDestroy",
+     "hip.mipmapped_array_create(width=256, height=256, num_levels=1, fmt=HIP_AD_FORMAT_FLOAT, num_channels=1)",
+     "hip.mipmapped_array_destroy(arr)",
+     "4 * 1 * 256 * 256"),
+    ("hipMallocMipmappedArray+hipMipmappedArrayDestroy",
+     "hip.malloc_mipmapped_array(width=256, height=256, num_levels=1, desc_x=32)",
+     "hip.mipmapped_array_destroy(arr)",
+     "4 * 256 * 256"),
+    # Multi-level: 128x128, 3 levels => 4*(128*128 + 64*64 + 32*32) = 4*(16384+4096+1024) = 4*21504 = 86016
+    ("hipMallocMipmappedArray+hipFreeMipmappedArray[3levels]",
+     "hip.malloc_mipmapped_array(width=128, height=128, num_levels=3, desc_x=32)",
+     "hip.free_mipmapped_array(arr)",
+     "4 * (128*128 + 64*64 + 32*32)"),
+    ("hipMipmappedArrayCreate+hipMipmappedArrayDestroy[3levels]",
+     "hip.mipmapped_array_create(width=128, height=128, num_levels=3, fmt=HIP_AD_FORMAT_FLOAT, num_channels=1)",
+     "hip.mipmapped_array_destroy(arr)",
+     "4 * 1 * (128*128 + 64*64 + 32*32)"),
 ]
 
 
@@ -336,7 +360,7 @@ _ARRAY_FREE_TRACKING_CASES = [
     ids=[tid for tid, _, _, _ in _ARRAY_FREE_TRACKING_CASES],
 )
 def test_array_free_tracking(cts, alloc_call, free_call, expected_expr):
-    """Array alloc/free pairs should return pod_memory_used to zero."""
+    """Array and mipmapped array alloc/free pairs should return pod_memory_used to zero."""
     result = cts.run_hip_test(f"""\
         import os
         from hip_helper import HIPRuntime, HIPError, HIP_AD_FORMAT_FLOAT, HIP_ERROR_NOT_SUPPORTED
@@ -369,6 +393,6 @@ def test_array_free_tracking(cts, alloc_call, free_call, expected_expr):
             print(f"FAIL: delta={{used_after_alloc - used_before}} expected={{expected}} after_free={{used_after_free}} before={{used_before}}")
     """)
     if "NOT_SUPPORTED" in result.stdout:
-        pytest.skip("Array API not supported on this GPU")
+        pytest.skip("Array/mipmapped array API not supported on this GPU")
     assert result.succeeded, f"Subprocess failed: {result.stderr}"
     assert "PASS" in result.stdout, f"Array free tracking failed: {result.stdout}"
