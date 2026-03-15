@@ -806,6 +806,41 @@ pub(crate) unsafe extern "C" fn hip_device_total_mem_detour(
     }
 }
 
+/// Attaches Frida GUM hooks to all HIP memory allocation, deallocation, and info-spoofing APIs.
+///
+/// # Hook coverage (30 hooks registered here; 34 total including smi.rs and dlsym)
+///
+/// **Alloc (19):** hipMalloc, hipExtMallocWithFlags, hipHostMalloc, hipHostAlloc, hipMallocHost,
+/// hipMemAllocHost, hipMallocManaged, hipMallocAsync, hipMallocFromPoolAsync, hipMallocPitch,
+/// hipMemAllocPitch, hipMalloc3D, hipMemCreate, hipMallocArray, hipMalloc3DArray, hipArrayCreate,
+/// hipArray3DCreate, hipMallocMipmappedArray, hipMipmappedArrayCreate
+///
+/// **Free (9):** hipFree, hipHostFree, hipFreeHost, hipFreeAsync, hipMemRelease, hipFreeArray,
+/// hipArrayDestroy, hipFreeMipmappedArray, hipMipmappedArrayDestroy
+///
+/// **Spoofing (2 here):** hipMemGetInfo, hipDeviceTotalMem
+/// (3 more in smi.rs via dlsym: rsmi_dev_memory_total_get, amdsmi_get_gpu_memory_total,
+/// amdsmi_get_gpu_vram_info; plus 1 dlsym hook in hip_limiter.rs)
+///
+/// # Known gap: graph memory nodes
+///
+/// `hipGraphAddMemAllocNode` and `hipGraphAddMemFreeNode` are NOT hooked. These APIs use an
+/// internal CLR pool allocator (`MemoryPool::AllocateMemory` → `amd::SvmBuffer::malloc()`) that
+/// bypasses all public HIP APIs — neither `hipMalloc` nor `hipFree` is called during graph
+/// execution. Physical VRAM is allocated at `hipGraphLaunch` time, retained in a per-device pool
+/// across graph lifetimes, and only released to the OS via `hipDeviceGraphMemTrim()`.
+///
+/// This gap is accepted because:
+/// 1. No ML framework (PyTorch, JAX, TensorFlow, ONNX Runtime) uses graph memory alloc nodes —
+///    all pre-allocate via private pools or arena allocators before capture. The one edge case is
+///    cuBLAS/hipBLAS 12+ internal workspace calls during stream capture, which frameworks work
+///    around by pre-setting workspace via `cublasSetWorkspace()`.
+/// 2. No production GPU limiter (HAMi-core, tkestack/vcuda, NVIDIA MPS) hooks graph memory.
+/// 3. Synchronous enforcement is impossible — the internal allocator has no public interception
+///    point, and before/after queries on `hipDeviceGetGraphMemAttribute` are racy.
+///
+/// If graph memory becomes relevant, `hipDeviceGetGraphMemAttribute(hipGraphMemAttrReservedMemCurrent)`
+/// can monitor pool usage, and `hipDeviceGraphMemTrim()` can reclaim inactive memory.
 pub(crate) unsafe fn enable_hooks(hook_manager: &mut HookManager) -> Result<(), utils::HookError> {
     replace_symbol!(
         hook_manager,
