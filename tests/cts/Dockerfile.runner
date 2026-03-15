@@ -1,0 +1,47 @@
+# CTS Runner (thin) — Minimal test image for hip-limiter CTS.
+#
+# Contains only Python + pytest. ROCm, the limiter .so, and test files are
+# all volume-mounted from the host for instant iteration.
+#
+# Build (one-time, ~2s):
+#   docker build -t cts-runner -f tests/cts/Dockerfile.runner .
+#
+# Run (105/105 tests in ~30s):
+#   docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video \
+#     -v /opt/therock:/opt/rocm:ro \
+#     -v /usr/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:ro \
+#     -v $PWD/target/release/libhip_limiter.so:/workspace/libhip_limiter.so:ro \
+#     -v $PWD/tests/cts:/workspace/tests/cts:ro \
+#     cts-runner pytest -v tests/cts/
+
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
+    python3-pip \
+    ca-certificates \
+    libatomic1 \
+    libnuma1 \
+    libdrm2 \
+    libelf1 \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV ROCM_PATH=/opt/rocm
+ENV PATH="${ROCM_PATH}/bin:${PATH}"
+ENV LD_LIBRARY_PATH="${ROCM_PATH}/lib"
+ENV HIP_LIMITER_LIB=/workspace/libhip_limiter.so
+
+# ldconfig at container start needs this to index volume-mounted ROCm libs
+# so ctypes.util.find_library() works (used by SMI spoofing tests).
+RUN echo "/opt/rocm/lib" > /etc/ld.so.conf.d/rocm.conf
+
+RUN pip3 install --no-cache-dir pytest>=7.0
+
+WORKDIR /workspace
+
+# Refresh ldconfig cache at container start so ctypes.util.find_library()
+# picks up volume-mounted ROCm libraries (cache is stale from build time).
+ENTRYPOINT ["sh", "-c", "ldconfig 2>/dev/null; exec \"$@\"", "--"]
+CMD ["pytest", "-v", "tests/cts/"]
