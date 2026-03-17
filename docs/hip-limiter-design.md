@@ -61,12 +61,14 @@ Reads `TF_SHM_FILE` and `TF_VISIBLE_DEVICES` env vars. SHM is lazily opened on f
 
 ## Init Flow
 
-1. **Library load** — `#[ctor] entry_point()` runs when `LD_PRELOAD` loads the cdylib.
-2. **Config resolution** — selects operating mode per the priority table above.
-3. **Device mapping** — enumerates HIP devices, matches against config UUIDs by PCI BDF normalization (strips `amd-gpu-` prefix, lowercases).
-4. **SHM attach** — eager in standalone mode (created and injected at init), deferred in other modes (lazily opened on first hook invocation via `OnceCell`).
-5. **Isolation check** — hooks activate when isolation mode is `"soft"` or unset (`None`). Only an explicitly non-`"soft"` value skips hook installation.
-6. **Hook installation** — creates a Frida GUM `HookManager`, replaces 30 symbols in `libamdhip64.so` via inline hooks. Guarded by `catch_unwind` to prevent hook installation panics from crashing the host application. Installs a `dlsym` detour to catch late-loaded libraries (SMI libs loaded with `RTLD_LOCAL`). If `libamdhip64.so` is not yet loaded, installation is deferred until a `dlsym` call resolves a HIP symbol.
+1. **Library load** — `#[ctor] entry_point()` runs when `LD_PRELOAD` loads the cdylib. If `ENABLE_HIP_HOOKS=false`, the ctor sets `INIT_HOOKS_ATTEMPTED`, `HOOKS_INITIALIZED`, and `CTOR_COMPLETE` to `true` and returns immediately (full passthrough — no dlsym hook installed, so no deferred init path is reachable). Otherwise, the ctor installs the Frida `dlsym` hook and sets `CTOR_COMPLETE` — no logging, no limiter init, no HIP hook installation. This is critical: `logging::init()` (tracing subscriber setup) during `.init_array` corrupts HIP/ROCr internal state, breaking rocFFT's JIT kernel compilation (`HIPFFT_PARSE_ERROR`).
+2. **Deferred init** — on the first `dlsym` call for a HIP or SMI symbol (after `.init_array` completes), the `dlsym` detour triggers `init_hooks()` which runs the full init sequence below.
+3. **Logging** — `logging::init()` sets up the tracing subscriber. Must run after `.init_array` completes.
+4. **Config resolution** — selects operating mode per the priority table above.
+5. **Device mapping** — enumerates HIP devices, matches against config UUIDs by PCI BDF normalization (strips `amd-gpu-` prefix, lowercases).
+6. **SHM attach** — eager in standalone mode (created and injected at init), deferred in other modes (lazily opened on first hook invocation via `OnceCell`).
+7. **Isolation check** — hooks activate when isolation mode is `"soft"` or unset (`None`). Only an explicitly non-`"soft"` value skips hook installation.
+8. **Hook installation** — creates a Frida GUM `HookManager`, replaces 30 symbols in `libamdhip64.so` via inline hooks (19 alloc + 9 free + 2 info spoofing). The remaining 4 hooks (3 SMI spoofing + 1 `dlsym`) are installed at the `dlsym`-interception level, not as inline hooks. Guarded by `catch_unwind` to prevent hook installation panics from crashing the host application. If `libamdhip64.so` is not yet loaded when `init_hooks()` runs, inline hook installation is skipped; subsequent `dlsym` calls for HIP symbols retry via `try_install_hip_hooks()` until the library appears.
 
 ## Core Pattern: Reserve-Then-Allocate
 
@@ -90,7 +92,7 @@ The under-utilization window (between reserve and native call) is bounded by one
 
 ### `hip_limiter.rs` — Entry Point
 
-Globals: `GLOBAL_LIMITER: OnceLock<Limiter>` (the limiter instance), `HOOKS_INITIALIZED: AtomicBool` (whether hooks are installed), `GLOBAL_LIMITER_ERROR: OnceLock<String>` (records init failure), `LIMITER_ERROR_REPORTED: AtomicBool` (gates one-shot warning on first hooked call via CAS).
+Globals: `GLOBAL_LIMITER: OnceLock<Limiter>` (the limiter instance), `HOOKS_INITIALIZED: AtomicBool` (whether hooks are installed), `GLOBAL_LIMITER_ERROR: OnceLock<String>` (records init failure), `LIMITER_ERROR_REPORTED: AtomicBool` (gates one-shot warning on first hooked call via CAS), `CTOR_COMPLETE: AtomicBool` (signals `.init_array` is done — prevents `init_hooks()` from running during ctor), `INIT_HOOKS_ATTEMPTED: AtomicBool` (ensures `init_hooks()` runs at most once).
 
 Also contains the `dlsym` detour with a `thread_local! IN_DLSYM_DETOUR` recursion guard to prevent infinite loops when Frida's own symbol resolution triggers `dlsym`.
 
@@ -281,7 +283,7 @@ For DinD, add to Docker run flags:
 
 | Scenario | Behavior |
 |----------|----------|
-| **Hypervisor unreachable at init** | Limiter is never initialized. All hooks become passthrough — no enforcement. Logged as warning on first hooked call. Init blocks application startup for up to 30s (connect + request timeout). |
+| **Hypervisor unreachable at init** | Limiter is never initialized. All hooks become passthrough — no enforcement. Logged as warning. Init is deferred to first HIP API call (not at library load), so it does not block process startup during `.init_array`. |
 | **SHM unavailable at runtime** | SHM is lazily opened on first allocation via `OnceCell::get_or_try_init`. If open fails, the hook falls through to the native call (passthrough). Subsequent calls retry the `OnceCell` init. |
 | **SHM unavailable during free** | Pointer is removed from the DashMap tracker but `pod_memory_used` is never decremented, causing a permanent accounting leak for that allocation's size. |
 | **Stale heartbeat** | Logged as warning but enforcement continues with last-known limits. Heartbeat threshold is 2 seconds. Suppressed in standalone mode (no hypervisor to heartbeat). |
@@ -289,7 +291,7 @@ For DinD, add to Docker run flags:
 | **Hook installation panic** | Caught by `catch_unwind`. Hooks are not installed, error is logged. Application continues without enforcement. |
 | **Crash between free and decrement** | Over-reports memory usage (safe direction). Requires pod restart or SHM recreation to reset. |
 | **`pod_memory_used` drift** | No manual reset mechanism. Hypervisor must recreate SHM or pod must be deleted. In standalone mode, restarting all preloaded processes re-creates SHM with zeroed counters. |
-| **Invalid `TF_MEMORY_LIMIT`** | Limiter is not initialized, all hooks become passthrough. Logged as error. |
+| **Invalid `TF_MEMORY_LIMIT`** | Limiter is not initialized, all hooks become passthrough. Logged as warning. |
 | **`TF_MEMORY_LIMIT` with no visible GPUs** | Limiter is not initialized, logged as error: "TF_MEMORY_LIMIT set but no GPUs visible". |
 | **SHM directory not writable** | `SharedMemoryHandle::create` fails on `create_dir_all` or `shmem.create()`. Limiter is not initialized, passthrough. |
 | **HIP runtime enumeration failure** | GPU driver not loaded or broken. `hipGetDeviceCount` fails, limiter logs error and becomes passthrough. |
@@ -307,6 +309,6 @@ For DinD, add to Docker run flags:
 
 1. **Rust unit tests** (`cargo test -p hip-limiter -p hip-limiter-fuzz -p utils`) — size parser, size computation, UUID normalization, device resolution, SHM compat. No GPU needed.
 2. **Proptest fuzzer** (`hip-limiter-fuzz`) — property-based tests for accounting invariants under concurrent access, edge cases (zero-size, max-size, double-free), multi-device routing.
-3. **CTS on real GPU** (`tests/cts/`) — Python tests on MI325X via Docker with TheRock ROCm 7.11. Tests all hook variants, allocation enforcement, free tracking, info spoofing, concurrency, standalone mode, and edge cases.
+3. **CTS on real GPU** (`tests/cts/`) — Python tests on MI325X via Docker with TheRock ROCm 7.11. Tests all hook variants, allocation enforcement, free tracking, info spoofing, concurrency, standalone mode, edge cases, and FFT/hipRTC compatibility (regression tests for `.init_array` corruption).
 
 See [hip-memory-hook-coverage.md](hip-memory-hook-coverage.md) for the full hook inventory and known gaps.

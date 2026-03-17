@@ -26,23 +26,37 @@ static GLOBAL_LIMITER: OnceLock<Limiter> = OnceLock::new();
 static GLOBAL_LIMITER_ERROR: OnceLock<String> = OnceLock::new();
 static HOOKS_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static LIMITER_ERROR_REPORTED: AtomicBool = AtomicBool::new(false);
+/// Set at the end of the ctor to signal that .init_array processing is complete.
+/// The dlsym detour skips full init_hooks() until this is true, because
+/// logging::init() and other heavy initialization during .init_array corrupts
+/// HIP/ROCr internal state (breaks rocFFT's JIT → HIPFFT_PARSE_ERROR).
+static CTOR_COMPLETE: AtomicBool = AtomicBool::new(false);
+/// Tracks whether init_hooks() has been attempted (success or failure).
+/// Prevents repeated calls from the dlsym detour when the limiter fails to init.
+static INIT_HOOKS_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 
 #[ctor]
 unsafe fn entry_point() {
-    logging::init();
-
+    // Do NOT call logging::init() or init_hooks() here. Setting up the tracing
+    // subscriber during .init_array corrupts HIP/ROCr internal state, causing
+    // rocFFT's JIT kernel compilation to fail with HIPFFT_PARSE_ERROR.
+    //
+    // Instead, install only the dlsym Frida hook (lightweight, no logging needed).
+    // Full initialization (logging + limiter + HIP hooks) is deferred to the first
+    // HIP/SMI symbol lookup via the dlsym detour, AFTER .init_array completes.
     let enable_hip_hooks = env::var("ENABLE_HIP_HOOKS")
         .map(|value| value != "false")
         .unwrap_or(true);
 
-    tracing::info!("enable_hip_hooks: {enable_hip_hooks}");
-
     if !enable_hip_hooks {
+        INIT_HOOKS_ATTEMPTED.store(true, Ordering::Release);
         HOOKS_INITIALIZED.store(true, Ordering::Release);
+        CTOR_COMPLETE.store(true, Ordering::Release);
         return;
     }
 
-    init_hooks();
+    install_dlsym_hook();
+    CTOR_COMPLETE.store(true, Ordering::Release);
 }
 
 fn should_skip_hooks_on_no_limit() -> bool {
@@ -56,7 +70,7 @@ fn should_skip_hooks_on_no_limit() -> bool {
 
 fn record_limiter_error(message: impl Into<String>) {
     let message = message.into();
-    tracing::error!("{message}");
+    tracing::warn!("{message}");
     if GLOBAL_LIMITER_ERROR.set(message).is_err() {
         tracing::debug!("Limiter error already recorded");
     }
@@ -68,7 +82,7 @@ pub(crate) fn report_limiter_not_initialized() {
         .is_ok()
     {
         if let Some(reason) = GLOBAL_LIMITER_ERROR.get() {
-            tracing::warn!("Limiter not initialized; last error: {reason}");
+            tracing::warn!("Limiter not initialized: {reason}");
         } else {
             tracing::warn!("Limiter not initialized; init has not run");
         }
@@ -219,9 +233,9 @@ fn init_limiter() {
 
         // NOTE: Device visibility is the platform's responsibility (K8s device plugin),
         // not the limiter's. The limiter enforces memory limits via SHM hooks on whichever
-        // GPUs are visible. We do not set HIP_VISIBLE_DEVICES here because the limiter's
-        // #[ctor] initializes the HIP runtime (via hipGetDeviceCount) before we could set
-        // it, and HIP only reads HIP_VISIBLE_DEVICES at first initialization.
+        // GPUs are visible. We do not set HIP_VISIBLE_DEVICES here because init_limiter()
+        // calls hipGetDeviceCount (in standalone mode) before we could set it, and HIP
+        // only reads HIP_VISIBLE_DEVICES at first initialization.
 
         let is_standalone = standalone_shm.is_some();
 
@@ -285,11 +299,21 @@ fn try_install_hip_hooks() {
 }
 
 fn init_hooks() {
-    if cfg!(test) {
-        tracing::debug!("Test mode detected, skipping hook initialization");
+    // Ensure init_hooks() runs at most once, even if limiter init fails.
+    // Without this guard, every dlsym call for HIP symbols would retry
+    // init_hooks() when GLOBAL_LIMITER is None.
+    if INIT_HOOKS_ATTEMPTED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+        .is_err()
+    {
         return;
     }
 
+    if cfg!(test) {
+        return;
+    }
+
+    logging::init();
     init_limiter();
 
     let limiter = match GLOBAL_LIMITER.get() {
@@ -297,6 +321,9 @@ fn init_hooks() {
         None => {
             // Limiter failed to initialize (e.g., no hypervisor running).
             // Gracefully skip hooks — the library becomes a passthrough.
+            // Set HOOKS_INITIALIZED to prevent the dlsym detour from
+            // repeatedly calling try_install_hip_hooks() on every lookup.
+            HOOKS_INITIALIZED.store(true, Ordering::Release);
             report_limiter_not_initialized();
             return;
         }
@@ -310,6 +337,7 @@ fn init_hooks() {
             "Isolation level '{}' detected (non-soft), skipping hook initialization",
             isolation.expect("isolation checked above")
         );
+        HOOKS_INITIALIZED.store(true, Ordering::Release);
         return;
     }
 
@@ -317,6 +345,7 @@ fn init_hooks() {
 
     if should_skip_hooks_on_no_limit() && all_unlimited {
         tracing::info!("All devices have up_limit >= 100, skipping hooks installation");
+        HOOKS_INITIALIZED.store(true, Ordering::Release);
         return;
     }
 
@@ -325,7 +354,14 @@ fn init_hooks() {
         try_install_hip_hooks();
     }
 
-    // Install dlsym hook to catch dynamic library loading
+    install_dlsym_hook();
+    tracing::debug!("Hook initialization completed");
+}
+
+/// Install just the dlsym Frida hook (lightweight, no logging init required).
+/// Called from the ctor (before logging is safe) and from init_hooks().
+/// The dlsym hook triggers full init_hooks() when HIP symbols are first resolved.
+fn install_dlsym_hook() {
     static DLSYM_HOOK_ONCE: Once = Once::new();
     DLSYM_HOOK_ONCE.call_once(|| {
         let mut hook_manager = HookManager::default();
@@ -337,10 +373,10 @@ fn init_hooks() {
             FnDlsym,
             FN_DLSYM
         ) {
-            tracing::error!("Failed to install dlsym hook: {error}");
+            // Use eprintln — logging may not be initialized yet when called from the ctor.
+            eprintln!("[hip-limiter] Failed to install dlsym hook: {error}");
         }
     });
-    tracing::debug!("Hook initialization completed");
 }
 
 thread_local! {
@@ -387,9 +423,18 @@ unsafe extern "C" fn dlsym_detour(handle: *const c_void, symbol: *const c_char) 
     }
     let _guard = ResetGuard;
 
-    if is_hip_symbol && !HOOKS_INITIALIZED.load(Ordering::Acquire) {
-        tracing::debug!("dlsym observed HIP symbol {symbol_str}, ensuring hooks installed");
-        try_install_hip_hooks();
+    // On first HIP/SMI symbol lookup after .init_array completes, run full
+    // initialization (logging + limiter + hooks). Deferred from the ctor because
+    // logging::init() during .init_array corrupts HIP/ROCr state, breaking
+    // rocFFT's JIT compilation. During .init_array (CTOR_COMPLETE=false), dlsym
+    // calls pass through without initialization; the first post-.init_array
+    // lookup triggers init_hooks().
+    if CTOR_COMPLETE.load(Ordering::Acquire) {
+        if !INIT_HOOKS_ATTEMPTED.load(Ordering::Acquire) {
+            init_hooks();
+        } else if is_hip_symbol && !HOOKS_INITIALIZED.load(Ordering::Acquire) {
+            try_install_hip_hooks();
+        }
     }
 
     // For SMI symbols, intercept at the dlsym level: resolve the original
