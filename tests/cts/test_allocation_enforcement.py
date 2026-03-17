@@ -9,7 +9,7 @@ which the test parses to verify expected behavior.
 Key behaviors under test:
   - Allocations within limits succeed (hipSuccess = 0)
   - Allocations exceeding limits return hipErrorOutOfMemory (code 2)
-  - All allocation variants (hipMalloc, hipHostMalloc, etc.) are enforced
+  - All allocation variants (hipMalloc, hipMallocManaged, etc.) are enforced
   - SHM pod_memory_used is updated correctly after allocations
 """
 
@@ -174,13 +174,6 @@ ptr = hip.ext_malloc_with_flags(1024 * 1024, 0)
 print("ALLOC_OK")
 hip.free(ptr)
 """,
-    "hipHostMalloc": """\
-from hip_helper import HIPRuntime
-hip = HIPRuntime()
-ptr = hip.host_malloc(1024 * 1024, 0)
-print("ALLOC_OK")
-hip.host_free(ptr)
-""",
     "hipMallocManaged": """\
 from hip_helper import HIPRuntime
 hip = HIPRuntime()
@@ -204,27 +197,6 @@ ptr = hip.malloc_from_pool_async(1024 * 1024, pool, stream=0)
 print("ALLOC_OK")
 hip.free_async(ptr, 0)
 hip.device_synchronize()
-""",
-    "hipHostAlloc": """\
-from hip_helper import HIPRuntime
-hip = HIPRuntime()
-ptr = hip.host_alloc(1024 * 1024, 0)
-print("ALLOC_OK")
-hip.host_free(ptr)
-""",
-    "hipMallocHost": """\
-from hip_helper import HIPRuntime
-hip = HIPRuntime()
-ptr = hip.malloc_host(1024 * 1024)
-print("ALLOC_OK")
-hip.host_free(ptr)
-""",
-    "hipMemAllocHost": """\
-from hip_helper import HIPRuntime
-hip = HIPRuntime()
-ptr = hip.mem_alloc_host(1024 * 1024)
-print("ALLOC_OK")
-hip.host_free(ptr)
 """,
     "hipMallocPitch": """\
 from hip_helper import HIPRuntime
@@ -349,7 +321,6 @@ def test_each_alloc_variant(cts, variant):
     if "NOT_SUPPORTED" in result.stdout:
         pytest.skip(f"{variant} not supported on this GPU")
     assert "ALLOC_OK" in result.stdout, f"{variant} allocation failed: {result.stdout}"
-
 
 
 def test_alloc_shm_accounting(cts):
@@ -818,8 +789,8 @@ def _oom_script(alloc_expr, free_expr, preamble=""):
 class TestPerVariantOomEnforcement:
     """Each allocation variant must independently enforce the memory limit.
 
-    Gap: Previously only hipMalloc was tested for OOM. A bug where hipHostMalloc
-    or hipMallocManaged skipped enforcement would go undetected.
+    Gap: Previously only hipMalloc was tested for OOM. A bug where hipMallocManaged
+    or hipMallocAsync skipped enforcement would go undetected.
     """
 
     VARIANT_SCRIPTS = {
@@ -842,18 +813,10 @@ else:
 hip.free(fill_ptr)
 """,
         # Standard exception-based variants — all share the same template.
-        "hipHostMalloc": _oom_script(
-            "ptr = hip.host_malloc(over_size, 0)", "hip.host_free(ptr)"),
         "hipExtMallocWithFlags": _oom_script(
             "ptr = hip.ext_malloc_with_flags(over_size, 0)", "hip.free(ptr)"),
         "hipMallocManaged": _oom_script(
             "ptr = hip.malloc_managed(over_size, 1)", "hip.free(ptr)"),
-        "hipHostAlloc": _oom_script(
-            "ptr = hip.host_alloc(over_size, 0)", "hip.host_free(ptr)"),
-        "hipMallocHost": _oom_script(
-            "ptr = hip.malloc_host(over_size)", "hip.host_free(ptr)"),
-        "hipMemAllocHost": _oom_script(
-            "ptr = hip.mem_alloc_host(over_size)", "hip.host_free(ptr)"),
         # Async variants need device_synchronize for cleanup.
         "hipMallocAsync": _oom_script(
             "ptr = hip.malloc_async(over_size, 0)",

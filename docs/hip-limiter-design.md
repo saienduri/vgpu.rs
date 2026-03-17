@@ -68,7 +68,7 @@ Reads `TF_SHM_FILE` and `TF_VISIBLE_DEVICES` env vars. SHM is lazily opened on f
 5. **Device mapping** — enumerates HIP devices, matches against config UUIDs by PCI BDF normalization (strips `amd-gpu-` prefix, lowercases).
 6. **SHM attach** — eager in standalone mode (created and injected at init), deferred in other modes (lazily opened on first hook invocation via `OnceCell`).
 7. **Isolation check** — hooks activate when isolation mode is `"soft"` or unset (`None`). Only an explicitly non-`"soft"` value skips hook installation.
-8. **Hook installation** — creates a Frida GUM `HookManager`, replaces 30 symbols in `libamdhip64.so` via inline hooks (19 alloc + 9 free + 2 info spoofing). The remaining 4 hooks (3 SMI spoofing + 1 `dlsym`) are installed at the `dlsym`-interception level, not as inline hooks. Guarded by `catch_unwind` to prevent hook installation panics from crashing the host application. If `libamdhip64.so` is not yet loaded when `init_hooks()` runs, inline hook installation is skipped; subsequent `dlsym` calls for HIP symbols retry via `try_install_hip_hooks()` until the library appears.
+8. **Hook installation** — creates a Frida GUM `HookManager`, replaces 24 symbols in `libamdhip64.so` via inline hooks (15 alloc + 7 free + 2 info spoofing). The remaining 4 hooks (3 SMI spoofing + 1 `dlsym`) are installed at the `dlsym`-interception level, not as inline hooks. Guarded by `catch_unwind` to prevent hook installation panics from crashing the host application. If `libamdhip64.so` is not yet loaded when `init_hooks()` runs, inline hook installation is skipped; subsequent `dlsym` calls for HIP symbols retry via `try_install_hip_hooks()` until the library appears.
 
 ## Core Pattern: Reserve-Then-Allocate
 
@@ -124,9 +124,9 @@ Parses `TF_MEMORY_LIMIT` strings into bytes. Supports SI suffixes (G/GB/M/MB —
 
 ### `detour/mem.rs` — HIP API Hooks
 
-30 Frida inline hooks on `libamdhip64.so` (19 alloc + 9 free + 2 info spoofing). Three macros drive the hook logic:
+24 Frida inline hooks on `libamdhip64.so` (15 alloc + 7 free + 2 info spoofing). Three macros drive the hook logic:
 
-- **`check_and_alloc!`** — standard reserve-then-allocate for simple allocations (hipMalloc, hipHostMalloc, hipMallocAsync, arrays, mipmaps, etc.)
+- **`check_and_alloc!`** — standard reserve-then-allocate for simple allocations (hipMalloc, hipMallocManaged, hipMallocAsync, arrays, mipmaps, etc.)
 - **`check_and_alloc_pitched!`** — two-phase variant for pitched allocations where actual size depends on runtime pitch alignment
 - **`check_and_free!`** — native free first, then decrement accounting
 

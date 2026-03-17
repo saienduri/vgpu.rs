@@ -2,20 +2,31 @@
 
 All HIP memory allocation APIs that consume physical VRAM are hooked. This document tracks what is hooked, what was evaluated and excluded, and known gaps.
 
-## Hook Coverage (34 hooks)
+## Hook Coverage (28 hooks)
 
-**Alloc (19):** hipMalloc, hipExtMallocWithFlags, hipHostMalloc, hipHostAlloc, hipMallocHost, hipMemAllocHost, hipMallocManaged, hipMallocAsync, hipMallocFromPoolAsync, hipMallocPitch, hipMemAllocPitch, hipMalloc3D, hipMemCreate, hipMallocArray, hipMalloc3DArray, hipArrayCreate, hipArray3DCreate, hipMallocMipmappedArray, hipMipmappedArrayCreate
+**Alloc (15):** hipMalloc, hipExtMallocWithFlags, hipMallocManaged, hipMallocAsync, hipMallocFromPoolAsync, hipMallocPitch, hipMemAllocPitch, hipMalloc3D, hipMemCreate, hipMallocArray, hipMalloc3DArray, hipArrayCreate, hipArray3DCreate, hipMallocMipmappedArray, hipMipmappedArrayCreate
 
-**Free (9):** hipFree, hipHostFree, hipFreeHost, hipFreeAsync, hipMemRelease, hipFreeArray, hipArrayDestroy, hipFreeMipmappedArray, hipMipmappedArrayDestroy
+**Free (7):** hipFree, hipFreeAsync, hipMemRelease, hipFreeArray, hipArrayDestroy, hipFreeMipmappedArray, hipMipmappedArrayDestroy
 
 **Spoofing (5):** hipMemGetInfo, hipDeviceTotalMem (inline Frida), rsmi_dev_memory_total_get, amdsmi_get_gpu_memory_total, amdsmi_get_gpu_vram_info (dlsym-level)
 
 **System (1):** dlsym (catches late-loaded libraries)
 
+## Conservative hooks
+
+Two hooked APIs don't deterministically consume VRAM at allocation time but are hooked to prevent silent limit bypass:
+
+| API | Why hooked despite ambiguity |
+|-----|------------------------------|
+| `hipMallocManaged` | Uses HMM (Heterogeneous Memory Management). Pages start in system RAM and migrate to VRAM on GPU access via page faults. No VRAM consumed at `hipMallocManaged` time, but the full allocation can end up resident on the GPU. We account for the full requested size at allocation time because: (1) there is no hook point for page migration — it happens in the kernel driver, (2) the worst case is the full allocation landing on VRAM, and (3) under-accounting would allow silent overcommit. |
+| `hipExtMallocWithFlags` | Most flags allocate VRAM (e.g., `hipDeviceMallocDefault`, `hipDeviceMallocFinegrained`). The exception is `hipMallocSignalMemory` (flag `0x2`), which allocates 8 bytes of host-side doorbell memory for IPC signaling — no VRAM. We hook unconditionally because: (1) the common-case flags do allocate VRAM, (2) the 8-byte signal memory over-count is negligible, and (3) flag-conditional bypass would add complexity for no practical benefit. |
+
 ## Evaluated and correctly NOT hooked
 
 | API | Reason |
 |-----|--------|
+| `hipHostMalloc` / `hipHostAlloc` / `hipMallocHost` / `hipMemAllocHost` | Host pinned memory — allocates from system RAM, not VRAM. All four route through `ihipMalloc` with `CL_MEM_SVM_FINE_GRAIN_BUFFER` on the host context. The GPU can DMA to/from host pinned memory but it does not consume any VRAM capacity. |
+| `hipHostFree` / `hipFreeHost` | Corresponding free APIs for host pinned memory. Not hooked because the alloc side is not hooked. |
 | `hipMemAddressFree` / `hipMemAddressReserve` / `hipMemMap` / `hipMemUnmap` | VMM address management only — no physical VRAM. Physical backing comes via `hipMemCreate`/`hipMemRelease` which ARE hooked. |
 | `hipExternalMemoryGetMappedBuffer` | Maps memory allocated by another API (Vulkan, OpenGL, DMA-buf). No new physical allocation — the foreign API owns the VRAM. |
 | `hipMemPoolImportPointer` | Imports a pointer from another process's pool. No new allocation — memory was already allocated and accounted for in the exporting process. |

@@ -357,18 +357,6 @@ pub(crate) unsafe extern "C" fn hip_ext_malloc_with_flags_detour(
 }
 
 #[hook_fn]
-pub(crate) unsafe extern "C" fn hip_host_malloc_detour(
-    ptr: *mut *mut c_void,
-    size: usize,
-    flags: c_uint,
-) -> HipError {
-    let request_size = size as u64;
-    check_and_alloc!(ptr, request_size, "hipHostMalloc", || {
-        FN_HIP_HOST_MALLOC(ptr, size, flags)
-    })
-}
-
-#[hook_fn]
 pub(crate) unsafe extern "C" fn hip_malloc_managed_detour(
     dev_ptr: *mut *mut c_void,
     size: usize,
@@ -402,40 +390,6 @@ pub(crate) unsafe extern "C" fn hip_malloc_from_pool_async_detour(
     let request_size = size as u64;
     check_and_alloc!(dev_ptr, request_size, "hipMallocFromPoolAsync", || {
         FN_HIP_MALLOC_FROM_POOL_ASYNC(dev_ptr, size, mem_pool, stream)
-    })
-}
-
-#[hook_fn]
-pub(crate) unsafe extern "C" fn hip_host_alloc_detour(
-    ptr: *mut *mut c_void,
-    size: usize,
-    flags: c_uint,
-) -> HipError {
-    let request_size = size as u64;
-    check_and_alloc!(ptr, request_size, "hipHostAlloc", || {
-        FN_HIP_HOST_ALLOC(ptr, size, flags)
-    })
-}
-
-#[hook_fn]
-pub(crate) unsafe extern "C" fn hip_malloc_host_detour(
-    ptr: *mut *mut c_void,
-    size: usize,
-) -> HipError {
-    let request_size = size as u64;
-    check_and_alloc!(ptr, request_size, "hipMallocHost", || {
-        FN_HIP_MALLOC_HOST(ptr, size)
-    })
-}
-
-#[hook_fn]
-pub(crate) unsafe extern "C" fn hip_mem_alloc_host_detour(
-    ptr: *mut *mut c_void,
-    size: usize,
-) -> HipError {
-    let request_size = size as u64;
-    check_and_alloc!(ptr, request_size, "hipMemAllocHost", || {
-        FN_HIP_MEM_ALLOC_HOST(ptr, size)
     })
 }
 
@@ -530,16 +484,6 @@ pub(crate) unsafe extern "C" fn hip_malloc_3d_detour(
 #[hook_fn]
 pub(crate) unsafe extern "C" fn hip_free_detour(ptr: *mut c_void) -> HipError {
     check_and_free!(ptr, FN_HIP_FREE(ptr))
-}
-
-#[hook_fn]
-pub(crate) unsafe extern "C" fn hip_host_free_detour(ptr: *mut c_void) -> HipError {
-    check_and_free!(ptr, FN_HIP_HOST_FREE(ptr))
-}
-
-#[hook_fn]
-pub(crate) unsafe extern "C" fn hip_free_host_detour(ptr: *mut c_void) -> HipError {
-    check_and_free!(ptr, FN_HIP_FREE_HOST(ptr))
 }
 
 // NOTE: hipFreeAsync defers the actual GPU memory release until stream completion,
@@ -808,15 +752,15 @@ pub(crate) unsafe extern "C" fn hip_device_total_mem_detour(
 
 /// Attaches Frida GUM hooks to all HIP memory allocation, deallocation, and info-spoofing APIs.
 ///
-/// # Hook coverage (30 hooks registered here; 34 total including smi.rs and dlsym)
+/// # Hook coverage (24 hooks registered here; 28 total including smi.rs and dlsym)
 ///
-/// **Alloc (19):** hipMalloc, hipExtMallocWithFlags, hipHostMalloc, hipHostAlloc, hipMallocHost,
-/// hipMemAllocHost, hipMallocManaged, hipMallocAsync, hipMallocFromPoolAsync, hipMallocPitch,
-/// hipMemAllocPitch, hipMalloc3D, hipMemCreate, hipMallocArray, hipMalloc3DArray, hipArrayCreate,
-/// hipArray3DCreate, hipMallocMipmappedArray, hipMipmappedArrayCreate
+/// **Alloc (15):** hipMalloc, hipExtMallocWithFlags, hipMallocManaged, hipMallocAsync,
+/// hipMallocFromPoolAsync, hipMallocPitch, hipMemAllocPitch, hipMalloc3D, hipMemCreate,
+/// hipMallocArray, hipMalloc3DArray, hipArrayCreate, hipArray3DCreate, hipMallocMipmappedArray,
+/// hipMipmappedArrayCreate
 ///
-/// **Free (9):** hipFree, hipHostFree, hipFreeHost, hipFreeAsync, hipMemRelease, hipFreeArray,
-/// hipArrayDestroy, hipFreeMipmappedArray, hipMipmappedArrayDestroy
+/// **Free (7):** hipFree, hipFreeAsync, hipMemRelease, hipFreeArray, hipArrayDestroy,
+/// hipFreeMipmappedArray, hipMipmappedArrayDestroy
 ///
 /// **Spoofing (2 here):** hipMemGetInfo, hipDeviceTotalMem
 /// (3 more in smi.rs via dlsym: rsmi_dev_memory_total_get, amdsmi_get_gpu_memory_total,
@@ -861,38 +805,6 @@ pub(crate) unsafe fn enable_hooks(hook_manager: &mut HookManager) -> Result<(), 
     replace_symbol!(
         hook_manager,
         Some("libamdhip64."),
-        "hipHostMalloc",
-        hip_host_malloc_detour,
-        FnHip_host_malloc,
-        FN_HIP_HOST_MALLOC
-    )?;
-    replace_symbol!(
-        hook_manager,
-        Some("libamdhip64."),
-        "hipHostAlloc",
-        hip_host_alloc_detour,
-        FnHip_host_alloc,
-        FN_HIP_HOST_ALLOC
-    )?;
-    replace_symbol!(
-        hook_manager,
-        Some("libamdhip64."),
-        "hipMallocHost",
-        hip_malloc_host_detour,
-        FnHip_malloc_host,
-        FN_HIP_MALLOC_HOST
-    )?;
-    replace_symbol!(
-        hook_manager,
-        Some("libamdhip64."),
-        "hipMemAllocHost",
-        hip_mem_alloc_host_detour,
-        FnHip_mem_alloc_host,
-        FN_HIP_MEM_ALLOC_HOST
-    )?;
-    replace_symbol!(
-        hook_manager,
-        Some("libamdhip64."),
         "hipMallocManaged",
         hip_malloc_managed_detour,
         FnHip_malloc_managed,
@@ -926,22 +838,6 @@ pub(crate) unsafe fn enable_hooks(hook_manager: &mut HookManager) -> Result<(), 
         hip_free_detour,
         FnHip_free,
         FN_HIP_FREE
-    )?;
-    replace_symbol!(
-        hook_manager,
-        Some("libamdhip64."),
-        "hipHostFree",
-        hip_host_free_detour,
-        FnHip_host_free,
-        FN_HIP_HOST_FREE
-    )?;
-    replace_symbol!(
-        hook_manager,
-        Some("libamdhip64."),
-        "hipFreeHost",
-        hip_free_host_detour,
-        FnHip_free_host,
-        FN_HIP_FREE_HOST
     )?;
     replace_symbol!(
         hook_manager,
