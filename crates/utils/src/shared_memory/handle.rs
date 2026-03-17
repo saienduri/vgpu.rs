@@ -103,11 +103,15 @@ impl SharedMemoryHandle {
         })
     }
 
-    /// Creates a new shared memory segment.
+    /// Creates a new shared memory segment, or joins an existing one.
+    ///
+    /// If the segment already exists (another process created it first), opens it
+    /// without reinitializing — preserving any runtime state (e.g., `pod_memory_used`
+    /// counters) that the other process may have written.
     pub fn create(path: impl AsRef<Path>, configs: &[DeviceConfig]) -> Result<Self> {
         std::fs::create_dir_all(path.as_ref())?;
         let old_umask = unsafe { libc::umask(0) };
-        let mut shmem = match ShmemConf::new()
+        let (mut shmem, created_fresh) = match ShmemConf::new()
             .size(std::mem::size_of::<SharedDeviceState>())
             .use_tmpfs_with_dir(path.as_ref())
             .os_id(SHM_PATH_SUFFIX)
@@ -121,17 +125,23 @@ impl SharedMemoryHandle {
             )
             .create()
         {
-            Ok(shmem) => shmem,
-            Err(ShmemError::LinkExists) => {
-                // If it already exists, try to open it.
-                ShmemConf::new()
+            Ok(shmem) => (shmem, true),
+            Err(ShmemError::LinkExists) | Err(ShmemError::MappingIdExists) => {
+                // LinkExists: flink/symlink already present.
+                // MappingIdExists: tmpfs file or POSIX shm_open ID already present.
+                // Both mean another process created it first — open the existing segment.
+                let shmem = ShmemConf::new()
                     .size(std::mem::size_of::<SharedDeviceState>())
                     .use_tmpfs_with_dir(path.as_ref())
                     .os_id(SHM_PATH_SUFFIX)
                     .open()
-                    .context("Failed to open existing shared memory")?
+                    .context("Failed to open existing shared memory")?;
+                (shmem, false)
             }
-            Err(e) => return Err(anyhow::anyhow!("Failed to create shared memory: {e}")),
+            Err(e) => {
+                unsafe { libc::umask(old_umask); }
+                return Err(anyhow::anyhow!("Failed to create shared memory: {e}"));
+            }
         };
         // avoid cleanup by drop
         shmem.set_owner(false);
@@ -141,15 +151,14 @@ impl SharedMemoryHandle {
 
         let ptr = shmem.as_ptr() as *mut SharedDeviceState;
 
-        // Initialize the shared memory data.
-        unsafe {
-            ptr.write(SharedDeviceState::new(configs));
+        if created_fresh {
+            unsafe {
+                ptr.write(SharedDeviceState::new(configs));
+            }
+            info!(path = ?path.as_ref(), "Created shared memory segment");
+        } else {
+            info!(path = ?path.as_ref(), "Joined existing shared memory segment");
         }
-
-        info!(
-            path = ?path.as_ref(),
-            "Created shared memory segment"
-        );
 
         Ok(Self {
             shmem: RefCell::new(shmem),
@@ -235,6 +244,42 @@ mod tests {
 
         let handle3 = SharedMemoryHandle::open(&shm_path).expect("Failed to open third time");
         assert_eq!(handle3.get_state().device_count(), 0);
+    }
+
+    #[test]
+    fn test_create_twice_joins_existing_and_preserves_state() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let shm_path = temp_dir.path().join("test_create_twice");
+
+        let configs = vec![DeviceConfig {
+            device_idx: 0,
+            device_uuid: "GPU-test-uuid".to_string(),
+            up_limit: 100,
+            mem_limit: 1024 * 1024 * 1024,
+            sm_count: 0,
+            max_thread_per_sm: 0,
+            total_cuda_cores: 0,
+        }];
+
+        // First create succeeds normally
+        let handle1 = SharedMemoryHandle::create(&shm_path, &configs).expect("First create failed");
+        assert_eq!(handle1.get_state().device_count(), 1);
+
+        // Simulate runtime usage: first process has allocated 500 MiB
+        let simulated_usage: u64 = 500 * 1024 * 1024;
+        assert!(handle1.get_state().set_pod_memory_used(0, simulated_usage));
+
+        // Second create should join the existing segment (not error)
+        let handle2 = SharedMemoryHandle::create(&shm_path, &configs)
+            .expect("Second create failed — should join existing");
+        assert_eq!(handle2.get_state().device_count(), 1);
+
+        // Verify the second create did NOT zero out the accounting
+        let (_, _, _, _, used, _, _) = handle2.get_state().get_device_info(0).expect("device 0");
+        assert_eq!(
+            used, simulated_usage,
+            "Second create() must not reinitialize SHM — pod_memory_used was stomped"
+        );
     }
 
     #[test]

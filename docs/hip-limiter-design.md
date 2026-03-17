@@ -45,7 +45,7 @@ Init flow:
 
 **Heartbeat suppression:** In standalone mode there is no hypervisor writing heartbeats. The `standalone` flag suppresses heartbeat stale warnings in `try_reserve` and `get_pod_memory_usage`. This is log-noise reduction only — `is_healthy()` never blocks allocations.
 
-**SHM multi-process safety:** When multiple preloaded processes start concurrently, the first creates the SHM segment and subsequent processes join via `LinkExists`. Both paths call `ptr.write(SharedDeviceState::new(configs))`, so the race is between two identical writes (same `TF_MEMORY_LIMIT` → same `configs`). Write order does not matter.
+**SHM multi-process safety:** The first process creates the SHM segment and writes initial state via `ptr.write(SharedDeviceState::new(configs))`. Subsequent processes detect the existing segment (`MappingIdExists` on tmpfs, `LinkExists` on shm_open) and open it without reinitializing — preserving runtime state such as `pod_memory_used` counters. The narrow window between segment creation and first write is safe: zeroed memory yields `device_count == 0`, causing hooks to become passthrough (same as "SHM unavailable").
 
 **SHM cleanup:** `set_owner(false)` means the segment persists after process exit. The default path (`/dev/shm/tensor-fusion`) is on tmpfs, cleaned up on reboot. In containers, tmpfs is cleaned up on pod termination.
 

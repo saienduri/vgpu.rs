@@ -23,37 +23,43 @@ from conftest import DEFAULT_HIP_LIMITER_LIB, SUBPROCESS_TIMEOUT, requires_gpu
 pytestmark = requires_gpu
 
 
+def _standalone_env(shm_dir: str, mem_limit: str = "1G", extra_env: dict = None):
+    """Build env dict for standalone mode."""
+    env = os.environ.copy()
+    env["LD_PRELOAD"] = DEFAULT_HIP_LIMITER_LIB
+    env["TF_MEMORY_LIMIT"] = mem_limit
+    env["SHM_PATH"] = shm_dir
+    env["ENABLE_HIP_HOOKS"] = "true"
+    env["RUST_LOG"] = env.get("RUST_LOG", "hip_limiter=debug")
+
+    # Ensure mock mode env vars are NOT set
+    env.pop("TF_SHM_FILE", None)
+    env.pop("TF_VISIBLE_DEVICES", None)
+    env.pop("HYPERVISOR_IP", None)
+    env.pop("HYPERVISOR_PORT", None)
+
+    cts_dir = os.path.dirname(os.path.abspath(__file__))
+    env["PYTHONPATH"] = cts_dir
+
+    if extra_env:
+        for key, value in extra_env.items():
+            if value is None:
+                env.pop(key, None)
+            else:
+                env[key] = value
+
+    return env
+
+
 def _run_standalone(script: str, mem_limit: str = "1G",
                     extra_env: dict = None, timeout: int = SUBPROCESS_TIMEOUT):
     """Run a script with TF_MEMORY_LIMIT standalone mode (no SHM file, no hypervisor)."""
     with tempfile.TemporaryDirectory(prefix="cts_standalone_") as tmpdir:
         shm_dir = os.path.join(tmpdir, "shm")
         os.makedirs(shm_dir, exist_ok=True)
+        env = _standalone_env(shm_dir, mem_limit, extra_env)
 
-        env = os.environ.copy()
-        env["LD_PRELOAD"] = DEFAULT_HIP_LIMITER_LIB
-        env["TF_MEMORY_LIMIT"] = mem_limit
-        env["SHM_PATH"] = shm_dir
-        env["ENABLE_HIP_HOOKS"] = "true"
-        env["RUST_LOG"] = env.get("RUST_LOG", "hip_limiter=debug")
-
-        # Ensure mock mode env vars are NOT set
-        env.pop("TF_SHM_FILE", None)
-        env.pop("TF_VISIBLE_DEVICES", None)
-        env.pop("HYPERVISOR_IP", None)
-        env.pop("HYPERVISOR_PORT", None)
-
-        # Add PYTHONPATH for hip_helper imports
         cts_dir = os.path.dirname(os.path.abspath(__file__))
-        env["PYTHONPATH"] = cts_dir
-
-        if extra_env:
-            for key, value in extra_env.items():
-                if value is None:
-                    env.pop(key, None)
-                else:
-                    env[key] = value
-
         script_path = os.path.join(tmpdir, "test_script.py")
         with open(script_path, "w") as f:
             f.write(textwrap.dedent(script))
