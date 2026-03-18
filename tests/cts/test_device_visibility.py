@@ -42,7 +42,9 @@ class TestVisibleDevicesRemap:
 
         alloc_size = 4 * MiB
         script = f"""\
+import os
 from hip_helper import HIPRuntime, HIP_SUCCESS
+from shm_writer import read_pod_memory_used
 
 hip = HIPRuntime()
 
@@ -63,6 +65,8 @@ if err == HIP_SUCCESS and ptr != 0:
     free_mem, total_mem = hip.mem_get_info()
     print(f"TOTAL_MEM={{total_mem}}")
     print(f"FREE_MEM={{free_mem}}")
+    shm_used = read_pod_memory_used(os.environ["TF_SHM_FILE"], 0)
+    print(f"SHM_USED={{shm_used}}")
 else:
     print(f"ALLOC_FAIL={{err}}")
 """
@@ -79,8 +83,8 @@ else:
             f"Spoofed total mem ({total_mem}) != configured limit ({mem_limit})"
         )
 
-        # Verify SHM accounting for device 0
-        shm_used = fixture.read_pod_memory_used(device_idx=0)
+        # Verify SHM accounting for device 0 (reported by subprocess before atexit)
+        shm_used = values.get("SHM_USED", 0)
         assert shm_used == alloc_size, (
             f"SHM device 0 pod_memory_used ({shm_used}) != alloc size ({alloc_size})"
         )
@@ -106,7 +110,9 @@ else:
         alloc_size_dev1 = 4 * MiB
 
         script = f"""\
+import os
 from hip_helper import HIPRuntime, HIP_SUCCESS
+from shm_writer import read_pod_memory_used
 
 hip = HIPRuntime()
 count = hip.get_device_count()
@@ -131,6 +137,11 @@ if err1 == HIP_SUCCESS and ptr1 != 0:
     print("DEV1_ALLOC_OK")
 else:
     print(f"DEV1_ALLOC_FAIL={{err1}}")
+
+# Read SHM before exit (atexit handler will drain these)
+shm_file = os.environ["TF_SHM_FILE"]
+print(f"DEV0_SHM_USED={{read_pod_memory_used(shm_file, 0)}}")
+print(f"DEV1_SHM_USED={{read_pod_memory_used(shm_file, 1)}}")
 """
         result = fixture.run_hip_test(script)
         assert result.succeeded, f"Subprocess failed:\n{result.output}"
@@ -142,9 +153,9 @@ else:
         assert "DEV1_ALLOC_OK" in result.stdout, f"Device 1 alloc failed:\n{result.stdout}"
 
         # Each device's SHM entry should track its own allocations independently
-        shm = fixture.read_shm_accounting()
-        dev0_used = shm.devices.get(0, {}).get("pod_memory_used", -1)
-        dev1_used = shm.devices.get(1, {}).get("pod_memory_used", -1)
+        values = parse_kv_output(result.stdout)
+        dev0_used = values.get("DEV0_SHM_USED", -1)
+        dev1_used = values.get("DEV1_SHM_USED", -1)
 
         assert dev0_used == alloc_size_dev0, (
             f"Device 0 pod_memory_used ({dev0_used}) != expected ({alloc_size_dev0})"
@@ -165,7 +176,9 @@ class TestSingleDeviceAlloc:
         sizes_str = repr(sizes)
 
         script = f"""\
+import os
 from hip_helper import HIPRuntime, HIP_SUCCESS
+from shm_writer import read_pod_memory_used
 
 hip = HIPRuntime()
 count = hip.get_device_count()
@@ -184,12 +197,15 @@ for size in sizes:
     pointers.append(ptr)
 
 print(f"ALL_ALLOCS_OK count={{len(pointers)}}")
+shm_used = read_pod_memory_used(os.environ["TF_SHM_FILE"], 0)
+print(f"SHM_USED={{shm_used}}")
 """
         result = cts.run_hip_test(script)
         assert result.succeeded, f"Subprocess failed:\n{result.output}"
         assert "ALL_ALLOCS_OK" in result.stdout, f"Allocs failed:\n{result.stdout}"
 
-        shm_used = cts.read_pod_memory_used(device_idx=0)
+        values = parse_kv_output(result.stdout)
+        shm_used = values.get("SHM_USED", 0)
         assert shm_used == total_expected, (
             f"SHM device 0 pod_memory_used ({shm_used}) != expected ({total_expected})"
         )

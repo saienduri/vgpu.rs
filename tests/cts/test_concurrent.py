@@ -30,9 +30,10 @@ class TestMultithreadAlloc:
         """Spawn N threads that each allocate ALLOCS_PER_THREAD buffers, then verify
         that SHM pod_memory_used matches the total successfully allocated."""
         script = f"""\
+import os
 import threading
-import json
 from hip_helper import HIPRuntime, HIP_SUCCESS, HIP_ERROR_OUT_OF_MEMORY
+from shm_writer import read_pod_memory_used
 
 NUM_THREADS = {NUM_THREADS}
 ALLOCS_PER_THREAD = {ALLOCS_PER_THREAD}
@@ -66,6 +67,8 @@ for t in threads:
 total_success = sum(r["success"] for r in results.values())
 print(f"TOTAL_SUCCESS={{total_success}}")
 print(f"EXPECTED_BYTES={{total_success * ALLOC_SIZE}}")
+shm_used = read_pod_memory_used(os.environ["TF_SHM_FILE"], 0)
+print(f"SHM_USED={{shm_used}}")
 """
         result = cts.run_hip_test(script, timeout=60)
         assert result.succeeded, f"Subprocess failed:\n{result.output}"
@@ -77,8 +80,8 @@ print(f"EXPECTED_BYTES={{total_success * ALLOC_SIZE}}")
         expected_bytes = values.get("EXPECTED_BYTES", 0)
         assert total_success > 0, "No allocations succeeded — is the GPU available?"
 
-        # SHM pod_memory_used should match: all allocs are still live (no frees)
-        shm_used = cts.read_pod_memory_used(device_idx=0)
+        # SHM pod_memory_used reported by subprocess (before atexit cleanup)
+        shm_used = values.get("SHM_USED", 0)
         assert shm_used == expected_bytes, (
             f"SHM pod_memory_used ({shm_used}) != expected ({expected_bytes})"
         )
@@ -94,21 +97,26 @@ class TestMultiprocessAlloc:
     """
 
     def test_multiprocess_alloc(self, cts):
-        """Spawn N subprocesses each making a single allocation. After all complete,
-        SHM pod_memory_used should reflect the combined total."""
+        """Spawn N subprocesses each making a single allocation without freeing.
+        Each process's atexit handler drains its tracked allocations, so after
+        all processes exit, SHM pod_memory_used should return to 0."""
         num_procs = 4
         alloc_size = 2 * MiB
 
-        # Each subprocess allocates one buffer and prints its status
+        # Each subprocess allocates one buffer, reports SHM mid-flight, then exits.
+        # The atexit handler decrements pod_memory_used for the unfreed allocation.
         child_script = f"""\
+import os
 from hip_helper import HIPRuntime, HIP_SUCCESS
+from shm_writer import read_pod_memory_used
 hip = HIPRuntime()
 err, ptr = hip.malloc_raw({alloc_size})
 if err == HIP_SUCCESS and ptr != 0:
-    print("ALLOC_OK")
+    shm_used = read_pod_memory_used(os.environ["TF_SHM_FILE"], 0)
+    print(f"ALLOC_OK SHM_USED={{shm_used}}")
 else:
     print(f"ALLOC_FAIL={{err}}")
-# Do NOT free — leave allocation live so SHM reflects it
+# Do NOT free — atexit handler will drain allocation tracker
 """
         # Spawn all subprocesses concurrently rather than sequentially
         success_count = 0
@@ -123,14 +131,12 @@ else:
             "No subprocess allocations succeeded — test would pass trivially"
         )
 
-        # Each subprocess is independent, so SHM pod_memory_used accumulates.
-        # Subprocesses exit without freeing, so pod_memory_used is never decremented.
-        # The hypervisor (not the limiter) is responsible for cleanup on pod termination.
-        expected_bytes = success_count * alloc_size
+        # After all processes exit, their atexit handlers should have drained
+        # all tracked allocations. SHM pod_memory_used should be 0.
         shm_used = cts.read_pod_memory_used(device_idx=0)
-        assert shm_used == expected_bytes, (
-            f"SHM pod_memory_used ({shm_used}) != expected ({expected_bytes}) "
-            f"after {success_count} successful allocs across {num_procs} processes"
+        assert shm_used == 0, (
+            f"SHM pod_memory_used ({shm_used}) should be 0 after all {success_count} "
+            f"processes exited (atexit handler drains tracked allocations)"
         )
 
 
@@ -257,8 +263,10 @@ class TestMultithreadWithLimit:
         alloc_size = 2 * MiB
 
         script = f"""\
+import os
 import threading
 from hip_helper import HIPRuntime, HIP_SUCCESS, HIP_ERROR_OUT_OF_MEMORY
+from shm_writer import read_pod_memory_used
 
 NUM_THREADS = 16
 ALLOC_SIZE = {alloc_size}
@@ -286,6 +294,8 @@ for t in threads:
 print(f"SUCCESS={{results['success']}}")
 print(f"DENIED={{results['denied']}}")
 print(f"OTHER_ERR={{results['other_err']}}")
+shm_used = read_pod_memory_used(os.environ["TF_SHM_FILE"], 0)
+print(f"SHM_USED={{shm_used}}")
 """
         result = fixture.run_hip_test(script, timeout=60)
         assert result.succeeded, f"Subprocess failed:\n{result.output}"
@@ -308,8 +318,8 @@ print(f"OTHER_ERR={{results['other_err']}}")
             f"but got success={success_count}, denied={denied_count}"
         )
 
-        # SHM usage should match successful allocs
-        shm_used = fixture.read_pod_memory_used(device_idx=0)
+        # SHM usage reported by subprocess (before atexit cleanup)
+        shm_used = values.get("SHM_USED", 0)
         expected = success_count * alloc_size
         assert shm_used == expected, (
             f"SHM pod_memory_used ({shm_used}) != expected ({expected})"

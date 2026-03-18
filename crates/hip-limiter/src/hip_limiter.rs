@@ -258,6 +258,27 @@ fn init_limiter() {
 
         if GLOBAL_LIMITER.set(limiter).is_err() {
             record_limiter_error("GLOBAL_LIMITER already initialized");
+            return;
+        }
+
+        // Register atexit handler to drain tracked allocations and decrement
+        // SHM counters. Without this, processes that exit without calling
+        // hipFree (e.g., PyTorch's caching allocator) leave stale
+        // pod_memory_used in SHM, causing OOM for subsequent processes.
+        //
+        // catch_unwind: by the time atexit runs, Rust's TLS destructors may
+        // have already fired, causing panics in tracing or DashMap. The SHM
+        // atomic ops themselves are safe (no TLS), so we use eprintln for
+        // logging in drain_allocations and catch any residual panics here.
+        extern "C" fn on_exit() {
+            let _ = std::panic::catch_unwind(|| {
+                if let Some(limiter) = GLOBAL_LIMITER.get() {
+                    limiter.drain_allocations();
+                }
+            });
+        }
+        unsafe {
+            libc::atexit(on_exit);
         }
     });
 }

@@ -38,14 +38,16 @@ Init flow:
 1. Parse `TF_MEMORY_LIMIT` via `size_parser::parse_memory_limit()` → bytes
 2. Enumerate all visible GPUs via `hipGetDeviceCount` + `hipDeviceGetPCIBusId`
 3. Build `DeviceConfig` per GPU: `mem_limit` from env var, `up_limit: 100` (no compute throttling), `sm_count`/`max_thread_per_sm`/`total_cuda_cores: 0` (unused without ERL)
-4. Create SHM via `SharedMemoryHandle::create(shm_path, &configs)` at `{SHM_PATH}/shm` (default `/dev/shm/tensor-fusion/shm`). If SHM already exists (`LinkExists`), joins it. Both paths write fresh state with zeroed counters.
+4. Create SHM via `SharedMemoryHandle::create(shm_path, &configs)` at `{SHM_PATH}/shm` (default `/dev/shm/tensor-fusion/shm`). If SHM already exists (`MappingIdExists`/`LinkExists`), joins it without reinitializing — preserving runtime state from concurrent processes.
 5. Construct `Limiter` with `isolation = Some("soft")`, `standalone = true`
 6. Eagerly inject the SHM handle into the limiter's `OnceCell` via `set_shared_memory_handle()`
 7. Install hooks as normal — all hooks work identically across modes
 
 **Heartbeat suppression:** In standalone mode there is no hypervisor writing heartbeats. The `standalone` flag suppresses heartbeat stale warnings in `try_reserve` and `get_pod_memory_usage`. This is log-noise reduction only — `is_healthy()` never blocks allocations.
 
-**SHM multi-process safety:** The first process creates the SHM segment and writes initial state via `ptr.write(SharedDeviceState::new(configs))`. Subsequent processes detect the existing segment (`MappingIdExists` on tmpfs, `LinkExists` on shm_open) and open it without reinitializing — preserving runtime state such as `pod_memory_used` counters. The narrow window between segment creation and first write is safe: zeroed memory yields `device_count == 0`, causing hooks to become passthrough (same as "SHM unavailable").
+**SHM multi-process safety:** `create()` handles the race where the segment already exists (`MappingIdExists` on tmpfs, `LinkExists` on shm_open) by opening it instead of failing. Only the first creator writes initial state; subsequent joiners preserve existing runtime counters so concurrent processes don't stomp each other's `pod_memory_used`. The limiter's `atexit` handler (`drain_allocations`) ensures each process decrements its own usage on exit, preventing stale accumulation across sequential runs.
+
+**Process exit cleanup:** GPU runtimes (HIP on Linux, CUDA) do not call `hipFree`/`cudaFree` during process teardown — the kernel reclaims physical GPU memory directly. Frameworks like PyTorch's caching allocator also rely on this, never calling `hipFree` for cached blocks at exit. Without explicit cleanup, the limiter's `pod_memory_used` SHM counter would leak monotonically. The `drain_allocations` atexit handler solves this: it iterates the process-local `allocation_tracker` DashMap, aggregates per-device totals, and does one bulk `saturating_fetch_sub` per device. Registered via `libc::atexit` immediately after `GLOBAL_LIMITER` is set.
 
 **SHM cleanup:** `set_owner(false)` means the segment persists after process exit. The default path (`/dev/shm/tensor-fusion`) is on tmpfs, cleaned up on reboot. In containers, tmpfs is cleaned up on pod termination.
 
@@ -115,6 +117,7 @@ Key methods:
 - `record_allocation(device_idx, ptr, size)` — insert into DashMap
 - `record_free(ptr)` — remove from DashMap, `saturating_fetch_sub` on SHM
 - `set_shared_memory_handle(handle)` — eagerly set SHM for standalone mode
+- `drain_allocations()` — atexit handler: iterates `allocation_tracker`, aggregates per-device totals, bulk `saturating_fetch_sub` per device. Uses `eprintln` (not tracing) because TLS may be destroyed at exit time. Wrapped in `catch_unwind` at the call site.
 - `device_index_by_hip_device(hip_device)` — resolves HIP ordinal to SHM device index via PCI BDF
 - `device_index_by_pci_bdf(bdf)` — resolves PCI BDF to device index (used by amdsmi hooks)
 
@@ -248,7 +251,7 @@ AMD GPU UUIDs are PCI BDF-based. Three naming conventions exist:
 | `HTTP_REQUEST_TIMEOUT` | No | `30s` | Total HTTP request timeout (humantime format) |
 | `HTTP_CONNECT_TIMEOUT` | No | `15s` | TCP connect timeout |
 | `TF_ENABLE_LOG` | No | enabled | Set to `"off"`, `"0"`, or `"false"` to silence logs |
-| `TF_LOG_PATH` | No | stdout | Path for rolling log file (daily rotation, 7 files) |
+| `TF_LOG_PATH` | No | stderr | Path for rolling log file (daily rotation, 7 files) |
 | `TF_LOG_LEVEL` | No | `INFO` | tracing `EnvFilter` directive |
 | `TF_SHM_FILE` | No | — | Mock mode: use local file as SHM (bypasses hypervisor) |
 | `TF_VISIBLE_DEVICES` | No | — | Mock mode: comma-separated GPU UUIDs |

@@ -370,6 +370,52 @@ impl Limiter {
         true
     }
 
+    /// Drain all tracked allocations and decrement SHM counters.
+    /// Called at process exit (via `libc::atexit`) to prevent stale
+    /// `pod_memory_used` accumulation across sequential processes sharing
+    /// the same SHM segment.
+    ///
+    /// Aggregates per-device totals from the DashMap, then does one bulk
+    /// `saturating_fetch_sub` per device (avoids N atomic ops for N allocations).
+    ///
+    /// Uses `eprintln` instead of `tracing` because Rust's TLS destructors
+    /// may have already run by the time `atexit` fires, making the tracing
+    /// subscriber inaccessible.
+    pub(crate) fn drain_allocations(&self) {
+        let handle = match self.shared_memory_handle.get() {
+            Some(handle) => handle,
+            None => return, // SHM was never initialized — nothing to drain
+        };
+
+        // Aggregate per-device totals
+        let mut device_totals: std::collections::HashMap<usize, u64> =
+            std::collections::HashMap::new();
+        // Drain the tracker — removes all entries
+        self.allocation_tracker.retain(|_, (device_idx, size)| {
+            *device_totals.entry(*device_idx).or_default() += *size;
+            false // remove every entry
+        });
+
+        if device_totals.is_empty() {
+            return;
+        }
+
+        let state = handle.get_state();
+        for (device_idx, total_size) in &device_totals {
+            state.with_device_v2_or(
+                *device_idx,
+                |device| device.device_info.saturating_fetch_sub_pod_memory_used(*total_size),
+            );
+        }
+
+        let total_bytes: u64 = device_totals.values().sum();
+        let device_count = device_totals.len();
+        eprintln!(
+            "[hip-limiter] process exit (pid {}): drained {total_bytes} bytes across {device_count} device(s): {device_totals:?}",
+            std::process::id()
+        );
+    }
+
     pub(crate) fn isolation(&self) -> Option<&str> {
         self.isolation.as_deref()
     }

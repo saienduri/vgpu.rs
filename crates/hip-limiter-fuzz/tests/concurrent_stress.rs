@@ -229,6 +229,165 @@ fn concurrent_alloc_only_consistency() {
     assert!(limiter.pod_memory_used() > 0);
 }
 
+/// Concurrent drain while allocating: some threads alloc/free while one thread
+/// calls drain_allocations. After all threads join and drain completes,
+/// pod_memory_used must be 0 (drain removes everything that was tracked at the
+/// time of iteration, and any concurrent allocs that sneak in are still tracked).
+///
+/// This models the race between atexit drain and late allocations from other
+/// threads that haven't yet been joined. In practice, atexit runs after main()
+/// returns and all non-detached threads should be joined, but we test the
+/// worst case.
+#[test]
+fn concurrent_drain_while_allocating() {
+    let limiter = Arc::new(SimulatedLimiter::new(100_000_000));
+    let thread_count = 6;
+    let operations_per_thread = 500;
+
+    // Phase 1: Populate with some allocations
+    let mut initial_pointers = Vec::new();
+    for i in 0..100 {
+        if let Ok(ptr) = limiter.try_alloc((i as u64 + 1) * 100) {
+            initial_pointers.push(ptr);
+        }
+    }
+    assert!(limiter.pod_memory_used() > 0);
+
+    // Phase 2: Concurrent alloc/free threads + one drain thread
+    let drain_limiter = Arc::clone(&limiter);
+    let drain_handle = std::thread::spawn(move || {
+        // Small yield to let alloc threads start
+        std::thread::yield_now();
+        drain_limiter.drain_allocations()
+    });
+
+    let alloc_handles: Vec<_> = (0..thread_count)
+        .map(|thread_id| {
+            let limiter = Arc::clone(&limiter);
+            std::thread::spawn(move || {
+                let mut local_pointers: Vec<usize> = Vec::new();
+                let mut rng_state: u64 = thread_id as u64 + 99;
+
+                for _ in 0..operations_per_thread {
+                    rng_state ^= rng_state << 13;
+                    rng_state ^= rng_state >> 7;
+                    rng_state ^= rng_state << 17;
+
+                    let should_free = !local_pointers.is_empty() && (rng_state % 3 == 0);
+                    if should_free {
+                        let index = (rng_state as usize) % local_pointers.len();
+                        let pointer = local_pointers.swap_remove(index);
+                        limiter.free(pointer);
+                    } else {
+                        let size = (rng_state % 5_000) + 1;
+                        if let Ok(pointer) = limiter.try_alloc(size) {
+                            local_pointers.push(pointer);
+                        }
+                    }
+                }
+                local_pointers
+            })
+        })
+        .collect();
+
+    let drained = drain_handle.join().expect("drain thread should not panic");
+    assert!(drained > 0, "drain should have removed initial allocations");
+
+    let mut all_remaining: Vec<usize> = Vec::new();
+    for handle in alloc_handles {
+        let remaining = handle.join().expect("alloc thread should not panic");
+        all_remaining.extend(remaining);
+    }
+
+    // Key invariant: pod_memory_used == tracked_total (no drift from concurrent drain)
+    assert_eq!(
+        limiter.pod_memory_used(),
+        limiter.tracked_total(),
+        "pod_memory_used must equal tracked_total after concurrent drain + alloc/free"
+    );
+
+    // Final cleanup: free remaining + second drain to catch anything
+    for pointer in &all_remaining {
+        limiter.free(*pointer);
+    }
+    let final_drain = limiter.drain_allocations();
+
+    assert_eq!(limiter.pod_memory_used(), 0, "must be 0 after full cleanup");
+    assert_eq!(limiter.allocation_count(), 0);
+    // final_drain should be 0 since we freed everything manually
+    assert_eq!(final_drain, 0, "no allocations should remain after manual free");
+}
+
+/// Concurrent multi-device drain: threads allocate across devices while drain fires.
+/// Verifies per-device counters stay consistent.
+#[test]
+fn concurrent_multi_device_drain() {
+    let limiter = Arc::new(MultiDeviceSimulatedLimiter::new(&[100_000, 100_000, 100_000]));
+
+    // Populate
+    for device in 0..3 {
+        for i in 0..20 {
+            let _ = limiter.try_alloc(device, (i as u64 + 1) * 100);
+        }
+    }
+
+    let drain_limiter = Arc::clone(&limiter);
+    let drain_handle = std::thread::spawn(move || {
+        std::thread::yield_now();
+        drain_limiter.drain_allocations()
+    });
+
+    let alloc_handles: Vec<_> = (0..6)
+        .map(|thread_id| {
+            let limiter = Arc::clone(&limiter);
+            std::thread::spawn(move || {
+                let mut local_pointers = Vec::new();
+                let mut rng_state: u64 = thread_id as u64 + 77;
+                for _ in 0..200 {
+                    rng_state ^= rng_state << 13;
+                    rng_state ^= rng_state >> 7;
+                    rng_state ^= rng_state << 17;
+
+                    let should_free = !local_pointers.is_empty() && (rng_state % 3 == 0);
+                    if should_free {
+                        let index = (rng_state as usize) % local_pointers.len();
+                        let pointer = local_pointers.swap_remove(index);
+                        limiter.free(pointer);
+                    } else {
+                        let device = (rng_state as usize) % 3;
+                        let size = (rng_state % 3_000) + 1;
+                        if let Ok(ptr) = limiter.try_alloc(device, size) {
+                            local_pointers.push(ptr);
+                        }
+                    }
+                }
+                local_pointers
+            })
+        })
+        .collect();
+
+    let drained = drain_handle.join().expect("drain should not panic");
+    assert!(drained > 0);
+
+    let mut remaining = Vec::new();
+    for h in alloc_handles {
+        remaining.extend(h.join().expect("thread should not panic"));
+    }
+
+    // Free remaining and drain again
+    for ptr in &remaining {
+        limiter.free(*ptr);
+    }
+    limiter.drain_allocations();
+
+    for device in 0..3 {
+        assert_eq!(
+            limiter.pod_memory_used(device), 0,
+            "device {device} must be 0 after full cleanup"
+        );
+    }
+}
+
 /// Multi-device concurrent stress: threads target random devices.
 /// Verifies per-device accounting stays independent under cross-device contention.
 ///

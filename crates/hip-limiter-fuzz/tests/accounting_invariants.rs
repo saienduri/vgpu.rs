@@ -317,6 +317,110 @@ proptest! {
         }
     }
 
+    /// drain_allocations on a single device: after random alloc/free, drain must
+    /// return pod_memory_used to 0 and empty the tracker. Models the atexit handler.
+    #[test]
+    fn drain_returns_to_zero(operations in proptest::collection::vec(operation_strategy(), 1..500)) {
+        let limiter = SimulatedLimiter::new(10_000_000);
+        let mut live_pointers: Vec<usize> = Vec::new();
+
+        for operation in &operations {
+            match operation {
+                Operation::Alloc(size) => {
+                    if let Ok(pointer) = limiter.try_alloc(*size) {
+                        if *size > 0 {
+                            live_pointers.push(pointer);
+                        }
+                    }
+                }
+                Operation::Free(index) => {
+                    if !live_pointers.is_empty() {
+                        let idx = *index % live_pointers.len();
+                        let pointer = live_pointers.swap_remove(idx);
+                        limiter.free(pointer);
+                    }
+                }
+            }
+        }
+
+        // drain_allocations must return sum of remaining live allocation sizes
+        let used_before_drain = limiter.pod_memory_used();
+        let drained = limiter.drain_allocations();
+        prop_assert_eq!(drained, used_before_drain, "drained bytes must equal pod_memory_used before drain");
+        prop_assert_eq!(limiter.pod_memory_used(), 0, "pod_memory_used must be 0 after drain");
+        prop_assert_eq!(limiter.tracked_total(), 0, "tracked_total must be 0 after drain");
+        prop_assert_eq!(limiter.allocation_count(), 0, "allocation_count must be 0 after drain");
+    }
+
+    /// drain_allocations after partial free: alloc N, free some, drain the rest.
+    /// Verifies drain only removes what's still tracked, not what was already freed.
+    #[test]
+    fn drain_after_partial_free(
+        sizes in proptest::collection::vec(1u64..500_000, 2..50),
+        free_fraction in 0u8..100,
+    ) {
+        let limiter = SimulatedLimiter::new(u64::MAX / 2);
+        let mut pointers = Vec::new();
+
+        for size in &sizes {
+            if let Ok(pointer) = limiter.try_alloc(*size) {
+                pointers.push(pointer);
+            }
+        }
+
+        // Free a fraction of the allocations
+        let num_to_free = (pointers.len() as u64 * free_fraction as u64 / 100) as usize;
+        for pointer in pointers.drain(..num_to_free) {
+            limiter.free(pointer);
+        }
+
+        let used_before_drain = limiter.pod_memory_used();
+        let drained = limiter.drain_allocations();
+        prop_assert_eq!(drained, used_before_drain);
+        prop_assert_eq!(limiter.pod_memory_used(), 0);
+        prop_assert_eq!(limiter.allocation_count(), 0);
+    }
+
+    /// Multi-device drain: random alloc/free across devices, then drain all.
+    /// Each device's counter must independently return to 0.
+    #[test]
+    fn multi_device_drain_returns_to_zero(
+        operations in proptest::collection::vec(multi_device_op_strategy(3), 1..500)
+    ) {
+        let limiter = MultiDeviceSimulatedLimiter::new(&[5_000_000, 5_000_000, 5_000_000]);
+        let mut live: Vec<usize> = Vec::new();
+
+        for op in &operations {
+            match op {
+                MultiDeviceOp::Alloc { device_idx, size } => {
+                    if let Ok(ptr) = limiter.try_alloc(*device_idx, *size) {
+                        live.push(ptr);
+                    }
+                }
+                MultiDeviceOp::Free(index) => {
+                    if !live.is_empty() {
+                        let idx = *index % live.len();
+                        let ptr = live.swap_remove(idx);
+                        limiter.free(ptr);
+                    }
+                }
+            }
+        }
+
+        let drained = limiter.drain_allocations();
+        // All devices must be at 0
+        for device_idx in 0..3 {
+            prop_assert_eq!(
+                limiter.pod_memory_used(device_idx), 0,
+                "device {} must be 0 after drain", device_idx
+            );
+        }
+        // Drain total must be positive if there were any live allocations
+        if !live.is_empty() {
+            prop_assert!(drained > 0, "drained should be > 0 when there were live allocations");
+        }
+    }
+
     /// Multi-device: freeing a pointer on device 0 must not affect device 1's
     /// counter. Targeted test for cross-device free routing correctness.
     #[test]

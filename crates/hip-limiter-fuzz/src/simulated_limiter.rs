@@ -73,7 +73,7 @@ impl SimulatedLimiter {
 
         if new_used > self.mem_limit {
             // Over limit — roll back the reservation
-            self.pod_memory_used.fetch_sub(size, Ordering::AcqRel);
+            self.saturating_sub_pod_memory_used(size);
             return Err(());
         }
 
@@ -94,17 +94,7 @@ impl SimulatedLimiter {
         let Some((_, size)) = self.allocation_tracker.remove(&pointer) else {
             return false;
         };
-        // Use saturating_sub via CAS loop to match the real limiter's
-        // saturating_fetch_sub_pod_memory_used (prevents underflow wrapping).
-        loop {
-            let current = self.pod_memory_used.load(Ordering::Acquire);
-            let new_value = current.saturating_sub(size);
-            if self.pod_memory_used.compare_exchange_weak(
-                current, new_value, Ordering::AcqRel, Ordering::Acquire,
-            ).is_ok() {
-                break;
-            }
-        }
+        self.saturating_sub_pod_memory_used(size);
         true
     }
 
@@ -130,6 +120,24 @@ impl SimulatedLimiter {
     /// Returns the number of live tracked allocations.
     pub fn allocation_count(&self) -> usize {
         self.allocation_tracker.len()
+    }
+
+    /// Atomically subtract `size` from `pod_memory_used`, clamping at zero.
+    ///
+    /// Mirrors `saturating_fetch_sub_pod_memory_used` on `SharedDeviceInfoV2` in the
+    /// real limiter. Uses a CAS loop to prevent underflow wrapping.
+    fn saturating_sub_pod_memory_used(&self, size: u64) {
+        loop {
+            let current = self.pod_memory_used.load(Ordering::Acquire);
+            let new_value = current.saturating_sub(size);
+            if self
+                .pod_memory_used
+                .compare_exchange_weak(current, new_value, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break;
+            }
+        }
     }
 
     /// Simulate a pitched allocation (hipMallocPitch / hipMalloc3D).
@@ -165,13 +173,13 @@ impl SimulatedLimiter {
         let new_used = previous_used.saturating_add(estimated_size);
 
         if new_used > self.mem_limit {
-            self.pod_memory_used.fetch_sub(estimated_size, Ordering::AcqRel);
+            self.saturating_sub_pod_memory_used(estimated_size);
             return Err(());
         }
 
         // Phase 2: Native allocator
         if !native_succeeds {
-            self.pod_memory_used.fetch_sub(estimated_size, Ordering::AcqRel);
+            self.saturating_sub_pod_memory_used(estimated_size);
             return Err(());
         }
 
@@ -184,8 +192,8 @@ impl SimulatedLimiter {
 
             if new_total > self.mem_limit {
                 // Extra overhead pushes over limit — rollback everything
-                self.pod_memory_used.fetch_sub(extra, Ordering::AcqRel);
-                self.pod_memory_used.fetch_sub(estimated_size, Ordering::AcqRel);
+                // (estimated_size + extra = actual_size, rolled back in one op)
+                self.saturating_sub_pod_memory_used(estimated_size + extra);
                 return Err(());
             }
         }
@@ -194,6 +202,28 @@ impl SimulatedLimiter {
         let pointer = self.next_pointer.fetch_add(1, Ordering::Relaxed);
         self.allocation_tracker.insert(pointer, actual_size);
         Ok(pointer)
+    }
+
+    /// Drain all tracked allocations and decrement pod_memory_used.
+    ///
+    /// Models the real limiter's `drain_allocations()` atexit handler: iterates
+    /// the allocation tracker, aggregates per-device totals, and does a bulk
+    /// saturating_sub. After drain, pod_memory_used should be 0 and the tracker
+    /// should be empty (for a single-device limiter, there's only one device).
+    ///
+    /// Returns the total bytes drained.
+    pub fn drain_allocations(&self) -> u64 {
+        let mut total: u64 = 0;
+        self.allocation_tracker.retain(|_, size| {
+            total += *size;
+            false // remove every entry
+        });
+
+        if total > 0 {
+            self.saturating_sub_pod_memory_used(total);
+        }
+
+        total
     }
 
     /// Simulate an allocation where the native allocator fails after reservation.
@@ -219,12 +249,12 @@ impl SimulatedLimiter {
 
         if new_used > self.mem_limit {
             // Over limit — roll back
-            self.pod_memory_used.fetch_sub(size, Ordering::AcqRel);
+            self.saturating_sub_pod_memory_used(size);
             return Err(());
         }
 
         // Simulate native failure — roll back the reservation
-        self.pod_memory_used.fetch_sub(size, Ordering::AcqRel);
+        self.saturating_sub_pod_memory_used(size);
         Err(())
     }
 }
@@ -271,6 +301,22 @@ impl MultiDeviceSimulatedLimiter {
             return false;
         };
         self.devices[device_idx].free(device_pointer)
+    }
+
+    /// Drain all tracked allocations across all devices.
+    ///
+    /// Models the real atexit handler: clears the pointer-to-device map, then
+    /// delegates to each per-device `SimulatedLimiter::drain_allocations()` which
+    /// clears its own tracker and does a bulk `saturating_sub_pod_memory_used`.
+    /// Returns total bytes drained across all devices.
+    pub fn drain_allocations(&self) -> u64 {
+        // Clear the multi-device routing map (entries are no longer needed
+        // because per-device trackers will be drained independently).
+        self.pointer_device_map.retain(|_, _| false);
+
+        // Delegate to each device's drain — mirrors the real limiter's
+        // per-device aggregation + bulk saturating_sub pattern.
+        self.devices.iter().map(|device| device.drain_allocations()).sum()
     }
 
     pub fn pod_memory_used(&self, device_idx: usize) -> u64 {

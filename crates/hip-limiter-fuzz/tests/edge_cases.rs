@@ -330,3 +330,50 @@ fn saturating_add_prevents_overflow_when_near_full() {
     limiter.free(pointer2);
     assert_eq!(limiter.pod_memory_used(), 0);
 }
+
+/// drain_allocations called twice: second drain must be a no-op.
+/// Models the edge case where atexit fires on a limiter that was already drained
+/// (e.g., library cleanup followed by process exit).
+#[test]
+fn double_drain_is_idempotent() {
+    let limiter = SimulatedLimiter::new(10_000);
+    limiter.try_alloc(5_000).expect("should succeed");
+    assert_eq!(limiter.pod_memory_used(), 5_000);
+
+    let first = limiter.drain_allocations();
+    assert_eq!(first, 5_000);
+    assert_eq!(limiter.pod_memory_used(), 0);
+    assert_eq!(limiter.allocation_count(), 0);
+
+    let second = limiter.drain_allocations();
+    assert_eq!(second, 0);
+    assert_eq!(limiter.pod_memory_used(), 0);
+    assert_eq!(limiter.allocation_count(), 0);
+}
+
+/// drain_allocations on an empty limiter (no allocations ever made).
+/// Must return 0 without modifying pod_memory_used.
+#[test]
+fn drain_empty_limiter() {
+    let limiter = SimulatedLimiter::new(10_000);
+    assert_eq!(limiter.drain_allocations(), 0);
+    assert_eq!(limiter.pod_memory_used(), 0);
+}
+
+/// Multi-device double drain: second drain must be a no-op across all devices.
+#[test]
+fn multi_device_double_drain_is_idempotent() {
+    let limiter = MultiDeviceSimulatedLimiter::new(&[10_000, 10_000]);
+    limiter.try_alloc(0, 3_000).expect("device 0");
+    limiter.try_alloc(1, 4_000).expect("device 1");
+
+    let first = limiter.drain_allocations();
+    assert_eq!(first, 7_000);
+    assert_eq!(limiter.pod_memory_used(0), 0);
+    assert_eq!(limiter.pod_memory_used(1), 0);
+
+    let second = limiter.drain_allocations();
+    assert_eq!(second, 0);
+    assert_eq!(limiter.pod_memory_used(0), 0);
+    assert_eq!(limiter.pod_memory_used(1), 0);
+}

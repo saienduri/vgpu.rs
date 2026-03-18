@@ -75,11 +75,15 @@ else:
 
         alloc_size = 4 * MiB
         script = f"""\
+import os
 from hip_helper import HIPRuntime, HIP_SUCCESS
+from shm_writer import read_pod_memory_used
 hip = HIPRuntime()
 err, ptr = hip.malloc_raw({alloc_size})
 if err == HIP_SUCCESS:
     print("ALLOC_OK")
+    shm_used = read_pod_memory_used(os.environ["TF_SHM_FILE"], 0)
+    print(f"SHM_USED={{shm_used}}")
 else:
     print(f"ALLOC_FAIL={{err}}")
 """
@@ -87,8 +91,9 @@ else:
         assert result.succeeded, f"Subprocess failed:\n{result.output}"
         assert "ALLOC_OK" in result.stdout
 
-        # Stale heartbeat no longer causes passthrough — allocation is tracked in SHM.
-        shm_used = cts.read_pod_memory_used(device_idx=0)
+        # Read SHM value reported by the subprocess (before atexit cleanup)
+        values = parse_kv_output(result.stdout)
+        shm_used = values.get("SHM_USED", 0)
         assert shm_used == alloc_size, (
             f"SHM pod_memory_used ({shm_used}) should be {alloc_size} — "
             f"stale heartbeat no longer bypasses enforcement"
@@ -331,7 +336,9 @@ class TestSHMAccountingMatchesAllocs:
         sizes_str = repr(sizes)
 
         script = f"""\
+import os
 from hip_helper import HIPRuntime, HIP_SUCCESS
+from shm_writer import read_pod_memory_used
 hip = HIPRuntime()
 
 sizes = {sizes_str}
@@ -347,13 +354,16 @@ for size in sizes:
     pointers.append(ptr)
 
 print(f"ALL_ALLOCS_OK count={{len(pointers)}}")
+shm_used = read_pod_memory_used(os.environ["TF_SHM_FILE"], 0)
+print(f"SHM_USED={{shm_used}}")
 # Leave allocations live — do not free
 """
         result = cts.run_hip_test(script)
         assert result.succeeded, f"Subprocess failed:\n{result.output}"
         assert "ALL_ALLOCS_OK" in result.stdout, f"Not all allocs succeeded:\n{result.stdout}"
 
-        shm_used = cts.read_pod_memory_used(device_idx=0)
+        values = parse_kv_output(result.stdout)
+        shm_used = values.get("SHM_USED", 0)
         assert shm_used == total_expected, (
             f"SHM pod_memory_used ({shm_used}) != expected sum of alloc sizes ({total_expected})"
         )
@@ -365,8 +375,9 @@ print(f"ALL_ALLOCS_OK count={{len(pointers)}}")
         num_frees = 4  # Free first 4, keep last 2
 
         script = f"""\
-import json
+import os
 from hip_helper import HIPRuntime, HIP_SUCCESS
+from shm_writer import read_pod_memory_used
 
 hip = HIPRuntime()
 alloc_size = {alloc_size}
@@ -388,6 +399,8 @@ for i in range(num_frees):
 live_count = num_allocs - num_frees
 print(f"LIVE_COUNT={{live_count}}")
 print(f"LIVE_BYTES={{live_count * alloc_size}}")
+shm_used = read_pod_memory_used(os.environ["TF_SHM_FILE"], 0)
+print(f"SHM_USED={{shm_used}}")
 """
         result = cts.run_hip_test(script)
         assert result.succeeded, f"Subprocess failed:\n{result.output}"
@@ -396,7 +409,7 @@ print(f"LIVE_BYTES={{live_count * alloc_size}}")
         expected_live_bytes = values.get("LIVE_BYTES", 0)
         assert expected_live_bytes > 0
 
-        shm_used = cts.read_pod_memory_used(device_idx=0)
+        shm_used = values.get("SHM_USED", 0)
         assert shm_used == expected_live_bytes, (
             f"SHM pod_memory_used ({shm_used}) != expected live bytes ({expected_live_bytes})"
         )
@@ -430,6 +443,61 @@ print("ALL_FREED")
         shm_used = cts.read_pod_memory_used(device_idx=0)
         assert shm_used == 0, (
             f"SHM pod_memory_used ({shm_used}) should be 0 after all frees"
+        )
+
+
+class TestAtexitDrain:
+    """The limiter's atexit handler drains tracked allocations and decrements
+    SHM pod_memory_used on process exit. This prevents stale counter accumulation
+    when processes exit without calling hipFree (e.g., PyTorch's caching allocator)."""
+
+    def test_atexit_drains_unfreed_allocations(self, cts):
+        """Allocate without freeing. After subprocess exits, SHM should be 0
+        because the atexit handler drained the allocation tracker."""
+        alloc_size = 4 * MiB
+        script = f"""\
+from hip_helper import HIPRuntime, HIP_SUCCESS
+hip = HIPRuntime()
+err, ptr = hip.malloc_raw({alloc_size})
+if err == HIP_SUCCESS and ptr != 0:
+    print("ALLOC_OK")
+else:
+    print(f"ALLOC_FAIL={{err}}")
+# EXIT WITHOUT hipFree — atexit handler will drain
+"""
+        result = cts.run_hip_test(script)
+        assert result.succeeded, f"Subprocess failed:\n{result.output}"
+        assert "ALLOC_OK" in result.stdout
+
+        # After process exit, atexit handler should have decremented pod_memory_used
+        shm_used = cts.read_pod_memory_used(device_idx=0)
+        assert shm_used == 0, (
+            f"SHM pod_memory_used ({shm_used}) should be 0 after atexit drain"
+        )
+
+    def test_atexit_no_stale_accumulation(self, cts):
+        """Run two sequential processes that each allocate without freeing.
+        After both exit, SHM should be 0 — not 2x the allocation size."""
+        alloc_size = 2 * MiB
+        script = f"""\
+from hip_helper import HIPRuntime, HIP_SUCCESS
+hip = HIPRuntime()
+err, ptr = hip.malloc_raw({alloc_size})
+if err == HIP_SUCCESS and ptr != 0:
+    print("ALLOC_OK")
+else:
+    print(f"ALLOC_FAIL={{err}}")
+"""
+        # Run twice sequentially — without atexit, SHM would accumulate
+        for i in range(2):
+            result = cts.run_hip_test(script)
+            assert result.succeeded, f"Process {i} failed:\n{result.output}"
+            assert "ALLOC_OK" in result.stdout
+
+        shm_used = cts.read_pod_memory_used(device_idx=0)
+        assert shm_used == 0, (
+            f"SHM pod_memory_used ({shm_used}) should be 0 — "
+            f"stale counters from sequential processes should not accumulate"
         )
 
 

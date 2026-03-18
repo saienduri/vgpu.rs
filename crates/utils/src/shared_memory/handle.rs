@@ -107,7 +107,9 @@ impl SharedMemoryHandle {
     ///
     /// If the segment already exists (another process created it first), opens it
     /// without reinitializing — preserving any runtime state (e.g., `pod_memory_used`
-    /// counters) that the other process may have written.
+    /// counters) that the other process may have written. The limiter's atexit
+    /// handler (`drain_allocations`) is responsible for decrementing counters when
+    /// each process exits, preventing stale accumulation across sequential runs.
     pub fn create(path: impl AsRef<Path>, configs: &[DeviceConfig]) -> Result<Self> {
         std::fs::create_dir_all(path.as_ref())?;
         let old_umask = unsafe { libc::umask(0) };
@@ -274,7 +276,9 @@ mod tests {
             .expect("Second create failed — should join existing");
         assert_eq!(handle2.get_state().device_count(), 1);
 
-        // Verify the second create did NOT zero out the accounting
+        // Verify the second create preserved runtime state (counters not zeroed).
+        // The limiter's atexit handler (drain_allocations) is responsible for
+        // decrementing counters when each process exits.
         let (_, _, _, _, used, _, _) = handle2.get_state().get_device_info(0).expect("device 0");
         assert_eq!(
             used, simulated_usage,

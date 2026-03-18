@@ -63,14 +63,14 @@ pub fn get_fmt_layer(log_path: Option<String>) -> Box<dyn Layer<Registry> + Send
                         rotation_dir.display()
                     );
                     layer()
-                        .with_writer(std::io::stdout)
+                        .with_writer(std::io::stderr)
                         .with_target(true)
                         .boxed()
                 }
             }
         }
         _ => layer()
-            .with_writer(std::io::stdout)
+            .with_writer(std::io::stderr)
             .with_target(true)
             .boxed(),
     };
