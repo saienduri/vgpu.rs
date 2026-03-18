@@ -355,18 +355,25 @@ impl Limiter {
 
     /// Compare pod_memory_used (our counter) with real VRAM from the original hipMemGetInfo.
     /// Logs when they diverge, helping diagnose accounting drift.
+    ///
+    /// Emits three key metrics:
+    /// - `shm_vs_real_mib`: SHM counter minus real VRAM (positive = SHM over-reports)
+    /// - `tracker_vs_shm_mib`: DashMap sum minus SHM (negative = stale residual from other processes)
+    /// - `stale_mib`: at alloc_count=0, shows how much SHM was already non-zero before this process
     fn log_reconciliation(&self, device_idx: usize, alloc_count: u64) {
         use crate::detour::mem::FN_HIP_MEM_GET_INFO;
+
+        let pid = std::process::id();
 
         // Guard: hook may not be initialized yet during early startup
         let Some(hip_mem_get_info) = FN_HIP_MEM_GET_INFO.get() else {
             return;
         };
 
-        let our_used = self
+        let (our_used, mem_limit) = self
             .get_pod_memory_usage(device_idx)
-            .map(|(used, _limit)| used)
-            .unwrap_or(0);
+            .map(|(used, limit)| (used, limit))
+            .unwrap_or((0, 0));
 
         let mut real_free: usize = 0;
         let mut real_total: usize = 0;
@@ -389,21 +396,55 @@ impl Limiter {
         let tracker_vs_shm = tracked_bytes as i128 - our_used as i128;
         let tracker_vs_shm_mib = tracker_vs_shm / (1024 * 1024);
 
-        if shm_vs_real_mib.abs() > 100 {
+        // First alloc: detect stale SHM from prior processes that didn't drain
+        if alloc_count == 0 {
+            let stale = our_used.saturating_sub(tracked_bytes);
+            let stale_mib = stale / (1024 * 1024);
+            if stale_mib > 0 {
+                tracing::warn!(
+                    pid,
+                    device_idx,
+                    our_shm = our_used,
+                    real_vram = real_used,
+                    tracked_bytes,
+                    mem_limit,
+                    stale_mib,
+                    "STALE SHM: counter is {stale_mib} MiB above this process's tracked total \
+                     on first alloc — prior process(es) likely exited without drain"
+                );
+            } else {
+                tracing::info!(
+                    pid,
+                    device_idx,
+                    our_shm = our_used,
+                    real_vram = real_used,
+                    tracked_bytes,
+                    mem_limit,
+                    "initial SHM state on first alloc"
+                );
+            }
+            return;
+        }
+
+        if shm_vs_real_mib.abs() > 100 || tracker_vs_shm_mib.abs() > 100 {
             tracing::warn!(
+                pid,
                 alloc_count,
+                device_idx,
                 our_shm = our_used,
                 real_vram = real_used,
                 tracked_bytes,
                 tracked_count,
                 shm_vs_real_mib,
                 tracker_vs_shm_mib,
-                "RECONCILIATION DRIFT: SHM diverges from real VRAM by {shm_vs_real_mib} MiB \
-                 (tracker vs SHM: {tracker_vs_shm_mib} MiB)"
+                "RECONCILIATION DRIFT: SHM vs real VRAM = {shm_vs_real_mib} MiB, \
+                 tracker vs SHM = {tracker_vs_shm_mib} MiB"
             );
         } else {
             tracing::info!(
+                pid,
                 alloc_count,
+                device_idx,
                 our_shm = our_used,
                 real_vram = real_used,
                 tracked_bytes,
@@ -453,6 +494,7 @@ impl Limiter {
     /// may have already run by the time `atexit` fires, making the tracing
     /// subscriber inaccessible.
     pub(crate) fn drain_allocations(&self) {
+        let pid = std::process::id();
         let handle = match self.shared_memory_handle.get() {
             Some(handle) => handle,
             None => return, // SHM was never initialized — nothing to drain
@@ -472,18 +514,40 @@ impl Limiter {
         }
 
         let state = handle.get_state();
+
+        // Snapshot SHM before drain, drain, then snapshot after — shows the effect
+        let mut drain_details: Vec<String> = Vec::new();
         for (device_idx, total_size) in &device_totals {
-            state.with_device_v2_or(
-                *device_idx,
-                |device| device.device_info.saturating_fetch_sub_pod_memory_used(*total_size),
-            );
+            let before = state
+                .with_device_v2_or(*device_idx, |device| {
+                    device.device_info.get_pod_memory_used()
+                })
+                .unwrap_or(0);
+            state.with_device_v2_or(*device_idx, |device| {
+                device
+                    .device_info
+                    .saturating_fetch_sub_pod_memory_used(*total_size)
+            });
+            let after = state
+                .with_device_v2_or(*device_idx, |device| {
+                    device.device_info.get_pod_memory_used()
+                })
+                .unwrap_or(0);
+            drain_details.push(format!(
+                "dev{device_idx}: drained {} MiB (shm: {} -> {} MiB)",
+                total_size / (1024 * 1024),
+                before / (1024 * 1024),
+                after / (1024 * 1024),
+            ));
         }
 
         let total_bytes: u64 = device_totals.values().sum();
-        let device_count = device_totals.len();
+        let alloc_count = self.alloc_count.load(Ordering::Relaxed);
         eprintln!(
-            "[hip-limiter] process exit (pid {}): drained {total_bytes} bytes across {device_count} device(s): {device_totals:?}",
-            std::process::id()
+            "[hip-limiter] drain (pid {pid}): {total_bytes} bytes ({} MiB), \
+             {alloc_count} allocs tracked this process: [{}]",
+            total_bytes / (1024 * 1024),
+            drain_details.join(", ")
         );
     }
 
