@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -50,6 +50,8 @@ pub(crate) struct Limiter {
     allocation_tracker: DashMap<usize, (usize, u64)>,
     /// When true, heartbeat warnings are suppressed (no hypervisor to heartbeat).
     standalone: bool,
+    /// Monotonic allocation counter for periodic reconciliation diagnostics.
+    alloc_count: AtomicU64,
 }
 
 impl std::fmt::Debug for Limiter {
@@ -129,6 +131,7 @@ impl Limiter {
             isolation,
             allocation_tracker: DashMap::new(),
             standalone,
+            alloc_count: AtomicU64::new(0),
         })
     }
 
@@ -342,6 +345,74 @@ impl Limiter {
             return;
         }
         self.allocation_tracker.insert(ptr, (device_idx, size));
+
+        // Periodic reconciliation: compare our counter with real VRAM usage
+        let count = self.alloc_count.fetch_add(1, Ordering::Relaxed);
+        if count % 100 == 0 {
+            self.log_reconciliation(device_idx, count);
+        }
+    }
+
+    /// Compare pod_memory_used (our counter) with real VRAM from the original hipMemGetInfo.
+    /// Logs when they diverge, helping diagnose accounting drift.
+    fn log_reconciliation(&self, device_idx: usize, alloc_count: u64) {
+        use crate::detour::mem::FN_HIP_MEM_GET_INFO;
+
+        // Guard: hook may not be initialized yet during early startup
+        let Some(hip_mem_get_info) = FN_HIP_MEM_GET_INFO.get() else {
+            return;
+        };
+
+        let our_used = self
+            .get_pod_memory_usage(device_idx)
+            .map(|(used, _limit)| used)
+            .unwrap_or(0);
+
+        let mut real_free: usize = 0;
+        let mut real_total: usize = 0;
+        let result = unsafe { hip_mem_get_info(&mut real_free, &mut real_total) };
+        if result != 0 {
+            return; // native call failed, skip
+        }
+        let real_used = real_total.saturating_sub(real_free) as u64;
+        let tracked_count = self.allocation_tracker.len();
+        // Sum of all sizes in our process-local DashMap for this device
+        let tracked_bytes: u64 = self
+            .allocation_tracker
+            .iter()
+            .filter(|entry| entry.value().0 == device_idx)
+            .map(|entry| entry.value().1)
+            .sum();
+
+        let shm_vs_real = our_used as i128 - real_used as i128;
+        let shm_vs_real_mib = shm_vs_real / (1024 * 1024);
+        let tracker_vs_shm = tracked_bytes as i128 - our_used as i128;
+        let tracker_vs_shm_mib = tracker_vs_shm / (1024 * 1024);
+
+        if shm_vs_real_mib.abs() > 100 {
+            tracing::warn!(
+                alloc_count,
+                our_shm = our_used,
+                real_vram = real_used,
+                tracked_bytes,
+                tracked_count,
+                shm_vs_real_mib,
+                tracker_vs_shm_mib,
+                "RECONCILIATION DRIFT: SHM diverges from real VRAM by {shm_vs_real_mib} MiB \
+                 (tracker vs SHM: {tracker_vs_shm_mib} MiB)"
+            );
+        } else {
+            tracing::info!(
+                alloc_count,
+                our_shm = our_used,
+                real_vram = real_used,
+                tracked_bytes,
+                tracked_count,
+                shm_vs_real_mib,
+                tracker_vs_shm_mib,
+                "reconciliation check"
+            );
+        }
     }
 
     /// Record a free: look up the pointer's size, decrement SHM pod_memory_used.
