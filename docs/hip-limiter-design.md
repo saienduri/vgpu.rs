@@ -49,6 +49,35 @@ Init flow:
 
 **Process exit cleanup:** GPU runtimes (HIP on Linux, CUDA) do not call `hipFree`/`cudaFree` during process teardown — the kernel reclaims physical GPU memory directly. Frameworks like PyTorch's caching allocator also rely on this, never calling `hipFree` for cached blocks at exit. Without explicit cleanup, the limiter's `pod_memory_used` SHM counter would leak monotonically. The `drain_allocations` atexit handler solves this: it iterates the process-local `allocation_tracker` DashMap, aggregates per-device totals, and does one bulk `saturating_fetch_sub` per device. Registered via `libc::atexit` immediately after `GLOBAL_LIMITER` is set.
 
+### Process Reaping — Why atexit Isn't Enough
+
+The `drain_allocations` atexit handler handles normal process exits, but several scenarios bypass it entirely:
+
+**SIGKILL / OOM-kill:** The kernel terminates the process immediately. `atexit` handlers never run, leaving `pod_memory_used` inflated by however much the process had allocated.
+
+**GPU library residuals:** ROCm libraries allocate device memory via `hipMalloc` for internal caches and workspaces that are never freed during the process lifetime:
+
+| Library | Trigger | Residual | Allocations | Notes |
+|---------|---------|----------|-------------|-------|
+| **MIOpen** | First `nn.Conv2d` | ~153 MiB | 4 | Find-algorithm benchmarks + workspace cache |
+| **rocBLAS** | First GEMM (`torch.mm`) | ~101 MiB | 4 | Workspace buffers |
+| **rocFFT** | First FFT | ~2 MiB | 6 | JIT-compiled kernels |
+| **HIP context** | First GPU op | ~2 MiB | varies | Device context, command queues |
+
+*Measured empirically on MI325X with TheRock ROCm 7.11 using `validate_allocation_sources.py`. Values vary by workload shape, ROCm version, and `MIOPEN_FIND_MODE`.*
+
+These allocations go through `hipMalloc` (our hooks track them) but are never `hipFree`'d — the libraries rely on process exit to reclaim physical GPU memory. Our atexit drain handles this on normal exit. But if the process is SIGKILL'd, these residuals are orphaned in SHM.
+
+**Accumulation risk without reaping:** A typical PyTorch training process leaves ~250+ MiB of library residuals. If SIGKILL'd processes are not reaped, successive runs would accumulate phantom usage: 250 MiB → 500 MiB → 750 MiB, eventually starving the pod even though no GPU memory is actually in use.
+
+**The proc_slots mechanism:** A separate SHM segment (`proc_slots`, distinct from the main device state) contains a `ProcSlotTable` — a fixed array of 128 slots, each with a PID (`AtomicU32`) and per-device usage counters (`[AtomicU64; MAX_DEVICES]`). Each process claims a slot at init, recording its PID and updating per-device usage as allocations are made. On each new process init (and on OOM in `try_reserve`), the limiter calls `reap_dead_pids()` which:
+1. Scans all claimed slots for PIDs that no longer exist (`kill(pid, 0)` liveness check)
+2. For each dead PID, atomically claims the slot via CAS (prevents double-reap by concurrent processes)
+3. Subtracts the dead process's tracked per-device usage from `pod_memory_used`
+4. Zeros the slot for reuse
+
+This ensures that SIGKILL'd processes' phantom usage is recovered by the next process that starts, or by any running process whose allocation hits the limit and triggers a single internal reap-then-retry in `try_reserve`.
+
 **SHM cleanup:** `set_owner(false)` means the segment persists after process exit. The default path (`/dev/shm/tensor-fusion`) is on tmpfs, cleaned up on reboot. In containers, tmpfs is cleaned up on pod termination.
 
 **Size parser** (`size_parser.rs`): Parses human-readable memory limits — plain bytes (`137438953472`), SI suffixes (`126G`, `126GB`, `512M`), binary suffixes (`126GiB`, `512MiB`). Case-insensitive. Returns `None` for zero, negative, overflow, or unparseable input.
@@ -251,7 +280,7 @@ AMD GPU UUIDs are PCI BDF-based. Three naming conventions exist:
 | `HTTP_REQUEST_TIMEOUT` | No | `30s` | Total HTTP request timeout (humantime format) |
 | `HTTP_CONNECT_TIMEOUT` | No | `15s` | TCP connect timeout |
 | `TF_ENABLE_LOG` | No | enabled | Set to `"off"`, `"0"`, or `"false"` to silence logs |
-| `TF_LOG_PATH` | No | stderr | Path for rolling log file (daily rotation, 7 files) |
+| `TF_LOG_PATH` | No | `/tmp/tensor-fusion/tf.log.*` | Log destination. Default: rolling file (daily, 7 files). Set to `stderr` to log to stderr instead. |
 | `TF_LOG_LEVEL` | No | `INFO` | tracing `EnvFilter` directive |
 | `TF_SHM_FILE` | No | — | Mock mode: use local file as SHM (bypasses hypervisor) |
 | `TF_VISIBLE_DEVICES` | No | — | Mock mode: comma-separated GPU UUIDs |
