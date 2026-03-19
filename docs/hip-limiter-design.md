@@ -156,7 +156,7 @@ Parses `TF_MEMORY_LIMIT` strings into bytes. Supports SI suffixes (G/GB/M/MB —
 
 ### `detour/mem.rs` — HIP API Hooks
 
-24 Frida inline hooks on `libamdhip64.so` (15 alloc + 7 free + 2 info spoofing). Three macros drive the hook logic:
+27 Frida inline hooks on `libamdhip64.so` (15 alloc + 7 free + 5 info spoofing). Three macros drive the hook logic:
 
 - **`check_and_alloc!`** — standard reserve-then-allocate for simple allocations (hipMalloc, hipMallocManaged, hipMallocAsync, arrays, mipmaps, etc.)
 - **`check_and_alloc_pitched!`** — two-phase variant for pitched allocations where actual size depends on runtime pitch alignment

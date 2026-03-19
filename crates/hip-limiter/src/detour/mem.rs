@@ -809,9 +809,83 @@ pub(crate) unsafe extern "C" fn hip_get_device_properties_detour(
     result
 }
 
+/// Spoof `hipGetDevicePropertiesR0600` — versioned variant called by PyTorch (compiled against ROCm 6.x).
+/// Same ABI and struct layout as `hipGetDeviceProperties`; needs its own hook because Frida hooks
+/// by address and the versioned symbols resolve to different entry points in libamdhip64.so.
+#[hook_fn]
+pub(crate) unsafe extern "C" fn hip_get_device_properties_r0600_detour(
+    prop: *mut HipDevicePropPrefix,
+    device_id: c_int,
+) -> HipError {
+    if prop.is_null() {
+        return HIP_ERROR_INVALID_VALUE;
+    }
+    let result = FN_HIP_GET_DEVICE_PROPERTIES_R0600(prop, device_id);
+    if result != HIP_SUCCESS {
+        return result;
+    }
+
+    let limiter = match GLOBAL_LIMITER.get() {
+        Some(limiter) => limiter,
+        None => return result,
+    };
+
+    let device_idx = match limiter.device_index_by_hip_device(device_id) {
+        Ok(idx) => idx,
+        Err(_) => return result,
+    };
+
+    match limiter.get_pod_memory_usage(device_idx) {
+        Ok((_used, limit)) => {
+            (*prop).total_global_mem = limit as usize;
+        }
+        Err(e) => {
+            tracing::warn!(device_id, ?e, "hipGetDevicePropertiesR0600: failed to get pod memory usage, returning unpatched");
+        }
+    }
+
+    result
+}
+
+/// Spoof `hipGetDevicePropertiesR0000` — legacy versioned variant.
+#[hook_fn]
+pub(crate) unsafe extern "C" fn hip_get_device_properties_r0000_detour(
+    prop: *mut HipDevicePropPrefix,
+    device_id: c_int,
+) -> HipError {
+    if prop.is_null() {
+        return HIP_ERROR_INVALID_VALUE;
+    }
+    let result = FN_HIP_GET_DEVICE_PROPERTIES_R0000(prop, device_id);
+    if result != HIP_SUCCESS {
+        return result;
+    }
+
+    let limiter = match GLOBAL_LIMITER.get() {
+        Some(limiter) => limiter,
+        None => return result,
+    };
+
+    let device_idx = match limiter.device_index_by_hip_device(device_id) {
+        Ok(idx) => idx,
+        Err(_) => return result,
+    };
+
+    match limiter.get_pod_memory_usage(device_idx) {
+        Ok((_used, limit)) => {
+            (*prop).total_global_mem = limit as usize;
+        }
+        Err(e) => {
+            tracing::warn!(device_id, ?e, "hipGetDevicePropertiesR0000: failed to get pod memory usage, returning unpatched");
+        }
+    }
+
+    result
+}
+
 /// Attaches Frida GUM hooks to all HIP memory allocation, deallocation, and info-spoofing APIs.
 ///
-/// # Hook coverage (25 hooks registered here; 29 total including smi.rs and dlsym)
+/// # Hook coverage (27 hooks registered here; 31 total including smi.rs and dlsym)
 ///
 /// **Alloc (15):** hipMalloc, hipExtMallocWithFlags, hipMallocManaged, hipMallocAsync,
 /// hipMallocFromPoolAsync, hipMallocPitch, hipMemAllocPitch, hipMalloc3D, hipMemCreate,
@@ -821,7 +895,7 @@ pub(crate) unsafe extern "C" fn hip_get_device_properties_detour(
 /// **Free (7):** hipFree, hipFreeAsync, hipMemRelease, hipFreeArray, hipArrayDestroy,
 /// hipFreeMipmappedArray, hipMipmappedArrayDestroy
 ///
-/// **Spoofing (3 here):** hipMemGetInfo, hipDeviceTotalMem, hipGetDeviceProperties
+/// **Spoofing (5 here):** hipMemGetInfo, hipDeviceTotalMem, hipGetDeviceProperties{,R0600,R0000}
 /// (3 more in smi.rs via dlsym: rsmi_dev_memory_total_get, amdsmi_get_gpu_memory_total,
 /// amdsmi_get_gpu_vram_info; plus 1 dlsym hook in hip_limiter.rs)
 ///
@@ -1046,10 +1120,10 @@ pub(crate) unsafe fn enable_hooks(hook_manager: &mut HookManager) -> Result<(), 
         FnHip_device_total_mem,
         FN_HIP_DEVICE_TOTAL_MEM
     )?;
-    // hipGetDeviceProperties has three versioned symbols in libamdhip64.so:
-    //   hipGetDeviceProperties (default), hipGetDevicePropertiesR0000, hipGetDevicePropertiesR0600
-    // PyTorch compiles against the R0600 variant (via macro), but we hook the default symbol
-    // which Frida resolves to the same entry point. All three share the same ABI.
+    // hipGetDeviceProperties has three versioned symbols in libamdhip64.so, each at a
+    // different address: hipGetDeviceProperties (default @@hip_4.2),
+    // hipGetDevicePropertiesR0000 (@@hip_4.2), hipGetDevicePropertiesR0600 (@@hip_6.0).
+    // PyTorch compiles against the R0600 variant. All three share the same ABI.
     replace_symbol!(
         hook_manager,
         Some("libamdhip64."),
@@ -1057,6 +1131,22 @@ pub(crate) unsafe fn enable_hooks(hook_manager: &mut HookManager) -> Result<(), 
         hip_get_device_properties_detour,
         FnHip_get_device_properties,
         FN_HIP_GET_DEVICE_PROPERTIES
+    )?;
+    replace_symbol!(
+        hook_manager,
+        Some("libamdhip64."),
+        "hipGetDevicePropertiesR0600",
+        hip_get_device_properties_r0600_detour,
+        FnHip_get_device_properties_r0600,
+        FN_HIP_GET_DEVICE_PROPERTIES_R0600
+    )?;
+    replace_symbol!(
+        hook_manager,
+        Some("libamdhip64."),
+        "hipGetDevicePropertiesR0000",
+        hip_get_device_properties_r0000_detour,
+        FnHip_get_device_properties_r0000,
+        FN_HIP_GET_DEVICE_PROPERTIES_R0000
     )?;
 
     Ok(())
