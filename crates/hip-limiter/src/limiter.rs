@@ -6,7 +6,8 @@ use std::time::Duration;
 use dashmap::DashMap;
 use erl::KernelLimiter;
 use once_cell::sync::OnceCell;
-use utils::shared_memory::{erl_adapter::ErlSharedMemoryAdapter, handle::SharedMemoryHandle};
+use utils::shared_memory::proc_slots::ProcSlotHandle;
+use utils::shared_memory::{erl_adapter::ErlSharedMemoryAdapter, handle::SharedMemoryHandle, SharedDeviceState};
 
 use crate::hiplib::{self, HipDevice, HipError};
 
@@ -52,6 +53,8 @@ pub(crate) struct Limiter {
     standalone: bool,
     /// Monotonic allocation counter for periodic reconciliation diagnostics.
     alloc_count: AtomicU64,
+    /// Per-PID usage tracking in SHM (standalone mode only).
+    proc_slots: Option<ProcSlotHandle>,
 }
 
 impl std::fmt::Debug for Limiter {
@@ -103,6 +106,7 @@ impl Limiter {
         mut gpu_uuids: Vec<String>,
         isolation: Option<String>,
         standalone: bool,
+        proc_slots: Option<ProcSlotHandle>,
     ) -> Result<Self, Error> {
         gpu_uuids.sort();
         gpu_uuids.dedup();
@@ -132,6 +136,7 @@ impl Limiter {
             allocation_tracker: DashMap::new(),
             standalone,
             alloc_count: AtomicU64::new(0),
+            proc_slots,
         })
     }
 
@@ -198,6 +203,17 @@ impl Limiter {
         Err(Error::DeviceNotConfigured(format!("HIP device {hip_device}")))
     }
 
+    /// Log a warning if the hypervisor heartbeat is stale (non-standalone mode only).
+    fn warn_if_stale_heartbeat(&self, state: &SharedDeviceState, device_idx: usize) {
+        if !self.standalone && !state.is_healthy(Duration::from_secs(2)) {
+            tracing::warn!(
+                device_idx,
+                last_heartbeat = state.get_last_heartbeat(),
+                "Stale heartbeat detected, continuing with enforcement"
+            );
+        }
+    }
+
     pub(crate) fn get_pod_memory_usage(
         &self,
         raw_device_index: usize,
@@ -205,13 +221,7 @@ impl Limiter {
         let handle = self.get_or_init_shared_memory()?;
         let state = handle.get_state();
 
-        if !self.standalone && !state.is_healthy(Duration::from_secs(2)) {
-            tracing::warn!(
-                device_idx = raw_device_index,
-                last_heartbeat = state.get_last_heartbeat(),
-                "Stale heartbeat detected, continuing with enforcement"
-            );
-        }
+        self.warn_if_stale_heartbeat(state, raw_device_index);
 
         if let Some((used, limit)) = state.with_device_v2_or(
             raw_device_index,
@@ -262,23 +272,43 @@ impl Limiter {
         let handle = self.get_or_init_shared_memory()?;
         let state = handle.get_state();
 
-        if !self.standalone && !state.is_healthy(Duration::from_secs(2)) {
-            tracing::warn!(
-                device_idx = device_idx,
-                last_heartbeat = state.get_last_heartbeat(),
-                "Stale heartbeat detected, continuing with enforcement"
-            );
-        }
+        self.warn_if_stale_heartbeat(state, device_idx);
 
-        // NOTE: Between this fetch_add and the potential rollback fetch_sub below,
-        // pod_memory_used holds a transiently elevated value (actual_used + size).
-        // A concurrent hipMemGetInfo reader may see slightly less free memory than
-        // reality during this nanosecond-scale window. This is conservative (never
-        // over-reports free memory) and acceptable for lock-free atomics.
-        //
+        match self.atomic_reserve(state, device_idx, size) {
+            Ok(previous_used) => Ok(previous_used),
+            Err(e) => {
+                // Attempt to recover capacity by reaping dead processes. If any
+                // were reaped, retry the reservation once. This prevents permanent
+                // capacity loss when a sibling process is SIGKILL'd after our init.
+                if self.reap_dead_pids() > 0 {
+                    return self.atomic_reserve(
+                        self.get_or_init_shared_memory()?.get_state(),
+                        device_idx,
+                        size,
+                    );
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Atomically reserve `size` bytes on `device_idx` via fetch_add, rolling back
+    /// if the new total exceeds the limit.
+    ///
+    /// NOTE: Between the fetch_add and the potential rollback fetch_sub below,
+    /// pod_memory_used holds a transiently elevated value (actual_used + size).
+    /// A concurrent hipMemGetInfo reader may see slightly less free memory than
+    /// reality during this nanosecond-scale window. This is conservative (never
+    /// over-reports free memory) and acceptable for lock-free atomics.
+    fn atomic_reserve(
+        &self,
+        state: &SharedDeviceState,
+        device_idx: usize,
+        size: u64,
+    ) -> Result<u64, Error> {
         // Both fetch_add and get_mem_limit are read in a single with_device call
         // to avoid a race where the device becomes unavailable between calls.
-        let reserve_result = state.with_device_v2_or(
+        let reserve_result: Option<(u64, u64)> = state.with_device_v2_or(
             device_idx,
             |device| {
                 let previous_used = device.device_info.pod_memory_used.fetch_add(size, Ordering::AcqRel);
@@ -345,6 +375,10 @@ impl Limiter {
             return;
         }
         self.allocation_tracker.insert(ptr, (device_idx, size));
+
+        if let Some(ref ps) = self.proc_slots {
+            ps.add_usage(device_idx, size);
+        }
 
         // Periodic reconciliation: compare our counter with real VRAM usage
         let count = self.alloc_count.fetch_add(1, Ordering::Relaxed);
@@ -471,6 +505,9 @@ impl Limiter {
                 // the hypervisor is already in a degraded state, so this is acceptable.
                 // Re-inserting the entry would cause a double-free on retry.
                 tracing::warn!(size = size, device_idx = device_idx, "Cannot record free, SHM unavailable: {error}");
+                if let Some(ref ps) = self.proc_slots {
+                    ps.sub_usage(device_idx, size);
+                }
                 return true;
             }
         };
@@ -479,6 +516,11 @@ impl Limiter {
             device_idx,
             |device| device.device_info.saturating_fetch_sub_pod_memory_used(size),
         );
+
+        if let Some(ref ps) = self.proc_slots {
+            ps.sub_usage(device_idx, size);
+        }
+
         true
     }
 
@@ -549,6 +591,55 @@ impl Limiter {
             total_bytes / (1024 * 1024),
             drain_details.join(", ")
         );
+
+        // Release our proc slot. The return value (per-device usage snapshot) is
+        // intentionally unused: pod_memory_used was already subtracted above via
+        // the DashMap aggregation, which is the authoritative accounting path.
+        // The proc slot is purely for reaping dead processes.
+        if let Some(ref ps) = self.proc_slots {
+            let _ = ps.drain_our_slot();
+        }
+    }
+
+    /// Scan proc slots for dead PIDs and subtract their usage from pod_memory_used.
+    ///
+    /// Called during standalone init (before first allocation) and on OOM
+    /// (when `try_reserve` fails, to recover capacity from dead processes).
+    /// Uses CAS-based slot claiming internally, so concurrent calls are safe.
+    pub(crate) fn reap_dead_pids(&self) -> usize {
+        let Some(ref ps) = self.proc_slots else { return 0 };
+        let handle = match self.shared_memory_handle.get() {
+            Some(h) => h,
+            None => return 0,
+        };
+        let state = handle.get_state();
+        let reaped = ps.reap_dead();
+
+        for (dead_pid, usage) in &reaped {
+            for (device_idx, &bytes) in usage.iter().enumerate() {
+                if bytes > 0 {
+                    state.with_device_v2_or(device_idx, |device| {
+                        device.device_info.saturating_fetch_sub_pod_memory_used(bytes)
+                    });
+                    tracing::info!(
+                        dead_pid,
+                        device_idx,
+                        mib = bytes / (1024 * 1024),
+                        "Reaped dead process: subtracted usage from pod_memory_used"
+                    );
+                }
+            }
+        }
+
+        if !reaped.is_empty() {
+            tracing::info!(
+                pid = std::process::id(),
+                count = reaped.len(),
+                "Reaped dead process(es) from proc slots"
+            );
+        }
+
+        reaped.len()
     }
 
     pub(crate) fn isolation(&self) -> Option<&str> {

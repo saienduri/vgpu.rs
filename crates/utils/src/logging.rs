@@ -12,12 +12,77 @@ use tracing_subscriber::registry;
 use tracing_subscriber::{EnvFilter, Layer, Registry};
 
 const DEFAULT_LOG_PREFIX: &str = "tf.log";
+const DEFAULT_LOG_DIR: &str = "/tmp/tensor-fusion";
 const ENABLE_LOG_ENV_VAR: &str = "TF_ENABLE_LOG";
 pub const LOG_PATH_ENV_VAR: &str = "TF_LOG_PATH";
 const LOG_LEVEL_ENV_VAR: &str = "TF_LOG_LEVEL";
 const LOG_OFF: &str = "off";
+/// Set `TF_LOG_PATH` to this value to send logs to stderr instead of a file.
+const LOG_STDERR: &str = "stderr";
+
+/// Build a layer that writes to stderr.
+fn stderr_layer() -> Box<dyn Layer<Registry> + Send + Sync> {
+    layer()
+        .with_writer(std::io::stderr)
+        .with_target(true)
+        .boxed()
+}
+
+/// Build a file-based tracing layer writing to the given directory/path.
+/// Falls back to stderr if the file appender cannot be created.
+fn file_layer(path: &str) -> Box<dyn Layer<Registry> + Send + Sync> {
+    let path = Path::new(path);
+
+    let (rotation_dir, prefix) = if path.is_dir() {
+        (path, DEFAULT_LOG_PREFIX)
+    } else {
+        let base_dir = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let prefix = path
+            .file_name()
+            .and_then(|file| file.to_str())
+            .unwrap_or(DEFAULT_LOG_PREFIX);
+        (base_dir, prefix)
+    };
+
+    if let Err(e) = std::fs::create_dir_all(rotation_dir) {
+        eprintln!("hip-limiter: cannot create log dir {}: {e}", rotation_dir.display());
+        return stderr_layer();
+    }
+
+    match RollingFileAppender::builder()
+        .rotation(Rotation::DAILY)
+        .filename_prefix(prefix)
+        .max_log_files(7)
+        .build(rotation_dir)
+    {
+        Ok(appender) => layer()
+            .with_writer(appender)
+            .with_target(true)
+            .with_ansi(false)
+            .boxed(),
+        Err(err) => {
+            eprintln!(
+                "hip-limiter: failed to create log appender at {}: {err}",
+                rotation_dir.display()
+            );
+            stderr_layer()
+        }
+    }
+}
 
 /// initiate the global tracing subscriber
+///
+/// Log destination priority:
+///   1. `TF_ENABLE_LOG=off|0|false` → logging disabled
+///   2. `TF_LOG_PATH=stderr`        → log to stderr
+///   3. `TF_LOG_PATH=/some/path`    → log to that file/directory
+///   4. Default                     → log to `/tmp/tensor-fusion/tf.log.*`
+///
+/// An LD_PRELOAD library must not write to stderr by default — frameworks
+/// like PyTorch capture subprocess stderr and assert on the output.
 pub fn get_fmt_layer(log_path: Option<String>) -> Box<dyn Layer<Registry> + Send + Sync> {
     let filter = match env::var(ENABLE_LOG_ENV_VAR).as_deref() {
         Ok(LOG_OFF) | Ok("0") | Ok("false") => EnvFilter::new(LOG_OFF),
@@ -27,59 +92,21 @@ pub fn get_fmt_layer(log_path: Option<String>) -> Box<dyn Layer<Registry> + Send
             .from_env_lossy(),
     };
 
-    let fmt_layer = match log_path {
-        Some(path) => {
-            // path could be a specific a/b/c.log file name, split it to get base dir and prefix
-            let path = Path::new(&path);
-            let is_dir = path.is_dir();
-            let (rotation_dir, prefix) = if is_dir {
-                (path, DEFAULT_LOG_PREFIX)
-            } else {
-                let base_dir = path
-                    .parent()
-                    .filter(|parent| !parent.as_os_str().is_empty())
-                    .unwrap_or_else(|| Path::new("."));
-                let prefix = path
-                    .file_name()
-                    .and_then(|file| file.to_str())
-                    .unwrap_or(DEFAULT_LOG_PREFIX);
-                (base_dir, prefix)
-            };
-
-            match RollingFileAppender::builder()
-                .rotation(Rotation::DAILY)
-                .filename_prefix(prefix)
-                .max_log_files(7)
-                .build(rotation_dir)
-            {
-                Ok(appender) => layer()
-                    .with_writer(appender)
-                    .with_target(true)
-                    .with_ansi(false)
-                    .boxed(),
-                Err(err) => {
-                    tracing::error!(
-                        "failed to create rolling file appender at {}: {err}",
-                        rotation_dir.display()
-                    );
-                    layer()
-                        .with_writer(std::io::stderr)
-                        .with_target(true)
-                        .boxed()
-                }
-            }
+    let fmt_layer = match log_path.as_deref() {
+        Some(LOG_STDERR) => stderr_layer(),
+        Some(path) => file_layer(path),
+        None => {
+            // Default: ensure the directory exists and log into it
+            let _ = std::fs::create_dir_all(DEFAULT_LOG_DIR);
+            file_layer(DEFAULT_LOG_DIR)
         }
-        _ => layer()
-            .with_writer(std::io::stderr)
-            .with_target(true)
-            .boxed(),
     };
 
     fmt_layer.with_filter(filter).boxed()
 }
 
 pub fn init() {
-    let log_path = env::var(LOG_PATH_ENV_VAR).ok();
+    let log_path = env::var(LOG_PATH_ENV_VAR).ok().filter(|s| !s.is_empty());
     let fmt_layer = get_fmt_layer(log_path);
     registry().with(fmt_layer).init();
 }

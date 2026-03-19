@@ -6,6 +6,23 @@ use dashmap::DashMap;
 /// transient wrapping of the atomic counter.
 const MAX_ALLOC_SIZE: u64 = u64::MAX / 2;
 
+/// Atomically subtract `size` from `counter`, clamping at zero.
+///
+/// Uses a CAS loop to prevent underflow wrapping. Mirrors
+/// `saturating_fetch_sub_pod_memory_used` on `SharedDeviceInfoV2`.
+fn saturating_fetch_sub(counter: &AtomicU64, size: u64) {
+    loop {
+        let current = counter.load(Ordering::Acquire);
+        let new_value = current.saturating_sub(size);
+        if counter
+            .compare_exchange_weak(current, new_value, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            break;
+        }
+    }
+}
+
 /// Pure-Rust model of the hip-limiter's memory accounting logic.
 ///
 /// This faithfully reproduces the semantics of `limiter.rs` and the `check_and_alloc!`
@@ -25,6 +42,9 @@ pub struct SimulatedLimiter {
     /// Mirrors the SHM `pod_memory_used` atomic counter.
     /// Updated via `fetch_add` on alloc and `fetch_sub` on free.
     pod_memory_used: AtomicU64,
+    /// Mirrors the ProcSlot `used[device_idx]` counter for per-PID tracking.
+    /// Single-device model, so one AtomicU64 suffices.
+    proc_usage: AtomicU64,
     /// Maps fake pointer -> allocation size.
     /// Mirrors `allocation_tracker: DashMap<usize, (usize, u64)>` in the real limiter,
     /// but we omit the device_idx since we model a single device.
@@ -38,6 +58,7 @@ impl SimulatedLimiter {
         Self {
             mem_limit,
             pod_memory_used: AtomicU64::new(0),
+            proc_usage: AtomicU64::new(0),
             allocation_tracker: DashMap::new(),
             // Start at 1 so pointer 0 is never returned (mirrors real GPU behavior
             // where NULL/0 is reserved).
@@ -79,6 +100,7 @@ impl SimulatedLimiter {
 
         let pointer = self.next_pointer.fetch_add(1, Ordering::Relaxed);
         self.allocation_tracker.insert(pointer, size);
+        self.proc_usage.fetch_add(size, Ordering::AcqRel);
         Ok(pointer)
     }
 
@@ -95,6 +117,7 @@ impl SimulatedLimiter {
             return false;
         };
         self.saturating_sub_pod_memory_used(size);
+        self.saturating_sub_proc_usage(size);
         true
     }
 
@@ -117,27 +140,59 @@ impl SimulatedLimiter {
         self.mem_limit
     }
 
+    /// Returns the current per-PID usage (mirrors ProcSlot `used[device_idx]`).
+    pub fn proc_usage(&self) -> u64 {
+        self.proc_usage.load(Ordering::Acquire)
+    }
+
     /// Returns the number of live tracked allocations.
     pub fn allocation_count(&self) -> usize {
         self.allocation_tracker.len()
     }
 
-    /// Atomically subtract `size` from `pod_memory_used`, clamping at zero.
+    /// Inject stale external usage into `pod_memory_used` without tracking it.
     ///
-    /// Mirrors `saturating_fetch_sub_pod_memory_used` on `SharedDeviceInfoV2` in the
-    /// real limiter. Uses a CAS loop to prevent underflow wrapping.
-    fn saturating_sub_pod_memory_used(&self, size: u64) {
-        loop {
-            let current = self.pod_memory_used.load(Ordering::Acquire);
-            let new_value = current.saturating_sub(size);
-            if self
-                .pod_memory_used
-                .compare_exchange_weak(current, new_value, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                break;
+    /// Models a dead process that incremented the SHM counter but never freed.
+    /// This usage is invisible to `tracked_total()` and `allocation_tracker`,
+    /// just like real stale usage from a SIGKILL'd process.
+    pub fn inject_stale_usage(&self, size: u64) {
+        self.pod_memory_used.fetch_add(size, Ordering::AcqRel);
+    }
+
+    /// Recover stale usage from `pod_memory_used` (saturating subtract).
+    ///
+    /// Models the reap path: `reap_dead_pids` subtracts dead processes' usage
+    /// from the SHM counter via `saturating_fetch_sub_pod_memory_used`.
+    pub fn recover_stale_usage(&self, size: u64) {
+        self.saturating_sub_pod_memory_used(size);
+    }
+
+    /// Attempt allocation with reap-on-OOM retry, mirroring the real `try_reserve` flow.
+    ///
+    /// 1. Try `try_alloc(size)`
+    /// 2. If over limit, call `reap_fn` to recover stale capacity
+    /// 3. If reap recovered anything (returned > 0), retry once
+    /// 4. No second retry (prevents infinite recursion)
+    pub fn try_alloc_with_reap(&self, size: u64, reap_fn: impl FnOnce(&Self) -> u64) -> Result<usize, ()> {
+        match self.try_alloc(size) {
+            Ok(ptr) => Ok(ptr),
+            Err(()) => {
+                let recovered = reap_fn(self);
+                if recovered > 0 {
+                    self.try_alloc(size)
+                } else {
+                    Err(())
+                }
             }
         }
+    }
+
+    fn saturating_sub_pod_memory_used(&self, size: u64) {
+        saturating_fetch_sub(&self.pod_memory_used, size);
+    }
+
+    fn saturating_sub_proc_usage(&self, size: u64) {
+        saturating_fetch_sub(&self.proc_usage, size);
     }
 
     /// Simulate a pitched allocation (hipMallocPitch / hipMalloc3D).
@@ -201,6 +256,7 @@ impl SimulatedLimiter {
         // Phase 4: Record with actual_size
         let pointer = self.next_pointer.fetch_add(1, Ordering::Relaxed);
         self.allocation_tracker.insert(pointer, actual_size);
+        self.proc_usage.fetch_add(actual_size, Ordering::AcqRel);
         Ok(pointer)
     }
 
@@ -222,6 +278,9 @@ impl SimulatedLimiter {
         if total > 0 {
             self.saturating_sub_pod_memory_used(total);
         }
+
+        // Zero proc_usage (mirrors drain_our_slot zeroing the ProcSlot counters)
+        self.proc_usage.store(0, Ordering::Release);
 
         total
     }
@@ -289,11 +348,16 @@ impl MultiDeviceSimulatedLimiter {
     pub fn try_alloc(&self, device_idx: usize, size: u64) -> Result<usize, ()> {
         let device = self.devices.get(device_idx).ok_or(())?;
         let device_pointer = device.try_alloc(size)?;
+        Ok(self.register_pointer(device_idx, device_pointer, size))
+    }
+
+    /// Map a device-local pointer to a unique external pointer and track it.
+    fn register_pointer(&self, device_idx: usize, device_pointer: usize, size: u64) -> usize {
         let external_pointer = self.next_pointer.fetch_add(1, Ordering::Relaxed);
         if size > 0 {
             self.pointer_device_map.insert(external_pointer, (device_idx, device_pointer));
         }
-        Ok(external_pointer)
+        external_pointer
     }
 
     pub fn free(&self, pointer: usize) -> bool {
@@ -326,6 +390,42 @@ impl MultiDeviceSimulatedLimiter {
     pub fn device_count(&self) -> usize {
         self.devices.len()
     }
+
+    pub fn proc_usage(&self, device_idx: usize) -> u64 {
+        self.devices[device_idx].proc_usage()
+    }
+
+    /// Inject stale usage on a specific device (models dead process).
+    pub fn inject_stale_usage(&self, device_idx: usize, size: u64) {
+        self.devices[device_idx].inject_stale_usage(size);
+    }
+
+    /// Recover stale usage on a specific device.
+    pub fn recover_stale_usage(&self, device_idx: usize, size: u64) {
+        self.devices[device_idx].recover_stale_usage(size);
+    }
+
+    /// Attempt allocation with reap-on-OOM retry on a specific device.
+    pub fn try_alloc_with_reap(
+        &self,
+        device_idx: usize,
+        size: u64,
+        reap_fn: impl FnOnce(&Self) -> u64,
+    ) -> Result<usize, ()> {
+        let device = self.devices.get(device_idx).ok_or(())?;
+        match device.try_alloc(size) {
+            Ok(device_pointer) => Ok(self.register_pointer(device_idx, device_pointer, size)),
+            Err(()) => {
+                let recovered = reap_fn(self);
+                if recovered > 0 {
+                    let device_pointer = device.try_alloc(size)?;
+                    Ok(self.register_pointer(device_idx, device_pointer, size))
+                } else {
+                    Err(())
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -339,5 +439,25 @@ mod tests {
         assert_eq!(limiter.pod_memory_used(), 512);
         assert!(limiter.free(pointer));
         assert_eq!(limiter.pod_memory_used(), 0);
+    }
+
+    /// Zero-size allocations succeed, return a unique pointer, but are not
+    /// tracked — free returns false and no accounting is affected.
+    /// This matches real HIP behavior where hipMalloc(&ptr, 0) succeeds.
+    #[test]
+    fn zero_size_alloc_not_tracked() {
+        let limiter = SimulatedLimiter::new(1024);
+
+        let ptr1 = limiter.try_alloc(0).expect("zero-size should succeed");
+        let ptr2 = limiter.try_alloc(0).expect("zero-size should succeed");
+        assert_ne!(ptr1, ptr2, "each zero-size alloc gets a unique pointer");
+
+        assert_eq!(limiter.pod_memory_used(), 0, "zero-size must not affect counter");
+        assert_eq!(limiter.proc_usage(), 0, "zero-size must not affect proc_usage");
+        assert_eq!(limiter.allocation_count(), 0, "zero-size must not be tracked");
+
+        assert!(!limiter.free(ptr1), "free of zero-size pointer returns false");
+        assert!(!limiter.free(ptr2), "free of zero-size pointer returns false");
+        assert_eq!(limiter.pod_memory_used(), 0, "free of untracked pointer is noop");
     }
 }

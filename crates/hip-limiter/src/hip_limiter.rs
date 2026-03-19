@@ -15,6 +15,7 @@ use utils::hooks::HookManager;
 use utils::logging;
 use utils::replace_symbol;
 use utils::shared_memory::handle::SharedMemoryHandle;
+use utils::shared_memory::proc_slots::ProcSlotHandle;
 
 mod config;
 pub(crate) mod detour;
@@ -117,7 +118,7 @@ pub(crate) fn resolve_shm_path(standalone: bool) -> String {
 /// Standalone mode: parse TF_MEMORY_LIMIT, enumerate GPUs, create SHM.
 fn init_standalone_config(
     mem_limit_str: &str,
-) -> Result<(config::PodConfig, SharedMemoryHandle), String> {
+) -> Result<(config::PodConfig, SharedMemoryHandle, ProcSlotHandle), String> {
     if mock_shm_path().is_some() {
         tracing::warn!("TF_MEMORY_LIMIT is set, ignoring TF_SHM_FILE");
     }
@@ -152,6 +153,9 @@ fn init_standalone_config(
     let shm_handle = SharedMemoryHandle::create(&shm_path, &configs)
         .map_err(|e| format!("failed to create SHM: {e}"))?;
 
+    let proc_slots = ProcSlotHandle::create_and_claim(&shm_path)
+        .map_err(|e| format!("failed to create proc slots: {e}"))?;
+
     tracing::info!(
         mem_limit_bytes = mem_limit,
         mem_limit_str = %mem_limit_str,
@@ -165,6 +169,7 @@ fn init_standalone_config(
             isolation: Some(limiter::ISOLATION_SOFT.to_string()),
         },
         shm_handle,
+        proc_slots,
     ))
 }
 
@@ -205,9 +210,9 @@ fn init_limiter() {
         // Config priority: TF_MEMORY_LIMIT (standalone) > TF_SHM_FILE (mock) > hypervisor (prod).
         // Branch order below is standalone → prod → mock because the prod check tests
         // "mock_shm_path is None" (i.e., TF_SHM_FILE is NOT set), with mock as the fallback.
-        let (config, standalone_shm) = if let Ok(mem_limit_str) = env::var("TF_MEMORY_LIMIT") {
+        let (config, standalone_shm, proc_slots) = if let Ok(mem_limit_str) = env::var("TF_MEMORY_LIMIT") {
             match init_standalone_config(&mem_limit_str) {
-                Ok((config, shm)) => (config, Some(shm)),
+                Ok((config, shm, proc_slots)) => (config, Some(shm), Some(proc_slots)),
                 Err(e) => {
                     record_limiter_error(e);
                     return;
@@ -215,7 +220,7 @@ fn init_limiter() {
             }
         } else if mock_shm_path().is_none() {
             match init_production_config() {
-                Ok(config) => (config, None),
+                Ok(config) => (config, None, None),
                 Err(e) => {
                     record_limiter_error(e);
                     return;
@@ -223,7 +228,7 @@ fn init_limiter() {
             }
         } else {
             match init_mock_config() {
-                Ok(config) => (config, None),
+                Ok(config) => (config, None, None),
                 Err(e) => {
                     record_limiter_error(e);
                     return;
@@ -239,7 +244,7 @@ fn init_limiter() {
 
         let is_standalone = standalone_shm.is_some();
 
-        let limiter = match Limiter::new(config.gpu_uuids, config.isolation, is_standalone) {
+        let limiter = match Limiter::new(config.gpu_uuids, config.isolation, is_standalone, proc_slots) {
             Ok(limiter) => limiter,
             Err(error) => {
                 record_limiter_error(format!("failed to initialize limiter: {error}"));
@@ -279,6 +284,12 @@ fn init_limiter() {
         }
         unsafe {
             libc::atexit(on_exit);
+        }
+
+        // Reap dead process slots: subtract their stale usage from pod_memory_used.
+        // Must run after SHM handle is set and atexit is registered.
+        if let Some(limiter) = GLOBAL_LIMITER.get() {
+            limiter.reap_dead_pids();
         }
     });
 }

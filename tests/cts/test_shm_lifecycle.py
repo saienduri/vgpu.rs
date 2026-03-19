@@ -53,7 +53,7 @@ if err == HIP_SUCCESS and ptr != 0:
 else:
     print(f"ALLOC_RESULT={{err}}")
 """
-        result = cts.run_hip_test(script)
+        result = cts.run_hip_test(script, extra_env={"TF_LOG_PATH": "stderr"})
         assert result.succeeded, f"Subprocess failed:\n{result.output}"
 
         # Allocation should succeed (within limit) even with stale heartbeat.

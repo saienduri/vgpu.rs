@@ -18,6 +18,7 @@ pub mod erl_adapter;
 pub mod handle;
 pub mod manager;
 pub mod mutex;
+pub mod proc_slots;
 pub mod set;
 pub mod traits;
 
@@ -113,7 +114,7 @@ impl std::fmt::Display for PodIdentifier {
 
 const MAX_PROCESSES: usize = 2048;
 /// Maximum number of devices that can be stored in shared memory
-const MAX_DEVICES: usize = 16;
+pub const MAX_DEVICES: usize = 16;
 /// Maximum length of device UUID string (including null terminator)
 const MAX_UUID_LEN: usize = 64;
 

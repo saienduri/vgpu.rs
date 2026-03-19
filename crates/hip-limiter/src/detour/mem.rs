@@ -695,6 +695,21 @@ pub(crate) unsafe extern "C" fn hip_mipmapped_array_destroy_detour(
 
 // --- Info spoofing hooks ---
 
+/// Partial repr(C) mirror of hipDeviceProp_t — only fields up to `totalGlobalMem`.
+/// Used to patch the total memory field after calling the real hipGetDeviceProperties.
+/// Layout from hip_runtime_api.h (ROCm 6.x):
+///   char name[256]; hipUUID uuid; char luid[8]; unsigned int luidDeviceNodeMask;
+///   size_t totalGlobalMem; ...
+#[repr(C)]
+struct HipDevicePropPrefix {
+    name: [u8; 256],
+    uuid: [u8; 16],   // hipUUID
+    luid: [u8; 8],
+    luid_device_node_mask: u32,
+    // 4 bytes implicit padding (repr(C) aligns total_global_mem to 8 bytes)
+    total_global_mem: usize,     // offset 288
+}
+
 #[hook_fn]
 pub(crate) unsafe extern "C" fn hip_mem_get_info_detour(
     free: *mut usize,
@@ -750,9 +765,53 @@ pub(crate) unsafe extern "C" fn hip_device_total_mem_detour(
     }
 }
 
+/// Spoof `hipGetDeviceProperties` to report our memory limit as `totalGlobalMem`.
+///
+/// PyTorch's caching allocator reads `device_prop.totalGlobalMem` (from `hipGetDeviceProperties`,
+/// not `hipMemGetInfo`) to compute the byte limit for `set_per_process_memory_fraction()`.
+/// Without this hook, the fraction is computed against the real 256 GiB, producing a much larger
+/// byte limit than intended and preventing OOM tests from triggering.
+///
+/// Strategy: call the real function first (to populate all ~80 fields), then patch only
+/// `totalGlobalMem` with our spoofed limit.
+#[hook_fn]
+pub(crate) unsafe extern "C" fn hip_get_device_properties_detour(
+    prop: *mut HipDevicePropPrefix,
+    device_id: c_int,
+) -> HipError {
+    if prop.is_null() {
+        return HIP_ERROR_INVALID_VALUE;
+    }
+    let result = FN_HIP_GET_DEVICE_PROPERTIES(prop, device_id);
+    if result != HIP_SUCCESS {
+        return result;
+    }
+
+    let limiter = match GLOBAL_LIMITER.get() {
+        Some(limiter) => limiter,
+        None => return result, // limiter not initialized, return unpatched
+    };
+
+    let device_idx = match limiter.device_index_by_hip_device(device_id) {
+        Ok(idx) => idx,
+        Err(_) => return result, // unmapped device, return unpatched
+    };
+
+    match limiter.get_pod_memory_usage(device_idx) {
+        Ok((_used, limit)) => {
+            (*prop).total_global_mem = limit as usize;
+        }
+        Err(e) => {
+            tracing::warn!(device_id, ?e, "hipGetDeviceProperties: failed to get pod memory usage, returning unpatched");
+        }
+    }
+
+    result
+}
+
 /// Attaches Frida GUM hooks to all HIP memory allocation, deallocation, and info-spoofing APIs.
 ///
-/// # Hook coverage (24 hooks registered here; 28 total including smi.rs and dlsym)
+/// # Hook coverage (25 hooks registered here; 29 total including smi.rs and dlsym)
 ///
 /// **Alloc (15):** hipMalloc, hipExtMallocWithFlags, hipMallocManaged, hipMallocAsync,
 /// hipMallocFromPoolAsync, hipMallocPitch, hipMemAllocPitch, hipMalloc3D, hipMemCreate,
@@ -762,7 +821,7 @@ pub(crate) unsafe extern "C" fn hip_device_total_mem_detour(
 /// **Free (7):** hipFree, hipFreeAsync, hipMemRelease, hipFreeArray, hipArrayDestroy,
 /// hipFreeMipmappedArray, hipMipmappedArrayDestroy
 ///
-/// **Spoofing (2 here):** hipMemGetInfo, hipDeviceTotalMem
+/// **Spoofing (3 here):** hipMemGetInfo, hipDeviceTotalMem, hipGetDeviceProperties
 /// (3 more in smi.rs via dlsym: rsmi_dev_memory_total_get, amdsmi_get_gpu_memory_total,
 /// amdsmi_get_gpu_vram_info; plus 1 dlsym hook in hip_limiter.rs)
 ///
@@ -986,6 +1045,18 @@ pub(crate) unsafe fn enable_hooks(hook_manager: &mut HookManager) -> Result<(), 
         hip_device_total_mem_detour,
         FnHip_device_total_mem,
         FN_HIP_DEVICE_TOTAL_MEM
+    )?;
+    // hipGetDeviceProperties has three versioned symbols in libamdhip64.so:
+    //   hipGetDeviceProperties (default), hipGetDevicePropertiesR0000, hipGetDevicePropertiesR0600
+    // PyTorch compiles against the R0600 variant (via macro), but we hook the default symbol
+    // which Frida resolves to the same entry point. All three share the same ABI.
+    replace_symbol!(
+        hook_manager,
+        Some("libamdhip64."),
+        "hipGetDeviceProperties",
+        hip_get_device_properties_detour,
+        FnHip_get_device_properties,
+        FN_HIP_GET_DEVICE_PROPERTIES
     )?;
 
     Ok(())

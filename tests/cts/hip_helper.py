@@ -14,7 +14,7 @@ All methods raise HIPError on failure (non-zero hipError_t return).
 
 import ctypes
 import os
-from ctypes import POINTER, Structure, byref, c_int, c_size_t, c_ubyte, c_uint, c_ulonglong, c_ushort, c_void_p
+from ctypes import POINTER, Structure, byref, c_char, c_int, c_size_t, c_ubyte, c_uint, c_ulonglong, c_ushort, c_void_p
 from typing import Optional, Tuple
 
 
@@ -539,6 +539,22 @@ class HIPRuntime:
             "hipDeviceTotalMem",
         )
         return total.value
+
+    def get_device_properties_total_mem(self, device: int = 0) -> int:
+        """Get totalGlobalMem from hipGetDeviceProperties for a specific device.
+
+        hipDeviceProp_t is a large struct (~800 bytes). We only need totalGlobalMem
+        at offset 288 (after name[256] + uuid[16] + luid[8] + luidDeviceNodeMask[4] + pad[4]).
+        Allocate a buffer large enough for the full struct and read the field.
+        """
+        buf = (c_char * 4096)()  # hipDeviceProp_t is ~800 bytes; oversized for safety
+        self._check(
+            self._lib.hipGetDeviceProperties(byref(buf), device),
+            "hipGetDeviceProperties",
+        )
+        # totalGlobalMem is a size_t at offset 288
+        total_global_mem = c_size_t.from_buffer_copy(buf, 288)
+        return total_global_mem.value
 
     # --- Array allocation wrappers ---
 

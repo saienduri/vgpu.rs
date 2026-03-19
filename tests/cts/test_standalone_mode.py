@@ -259,7 +259,7 @@ class TestStandaloneEdgeCases:
             assert ptr != 0, "malloc failed"
             hip.free(ptr)
             print("PASS")
-        """, mem_limit="not_a_number")
+        """, mem_limit="not_a_number", extra_env={"TF_LOG_PATH": "stderr"})
         assert proc.returncode == 0, f"Failed: {proc.stderr}"
         assert "PASS" in proc.stdout, f"Passthrough failed: {proc.stdout}"
         # Verify the limiter logged the parse error (not silently ignored)
@@ -277,7 +277,7 @@ class TestStandaloneEdgeCases:
             assert ptr != 0, "malloc failed"
             hip.free(ptr)
             print("PASS")
-        """, mem_limit="0G")
+        """, mem_limit="0G", extra_env={"TF_LOG_PATH": "stderr"})
         assert proc.returncode == 0, f"Failed: {proc.stderr}"
         assert "PASS" in proc.stdout, f"Passthrough failed: {proc.stdout}"
         # Zero is treated as invalid by the parser

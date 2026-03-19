@@ -74,6 +74,7 @@ fn concurrent_alloc_free_consistency() {
     assert_eq!(limiter.pod_memory_used(), 0, "all freed, usage should be 0");
     assert_eq!(limiter.tracked_total(), 0);
     assert_eq!(limiter.allocation_count(), 0);
+    assert_eq!(limiter.proc_usage(), 0, "proc_usage must be 0 after all freed");
 }
 
 /// Concurrent allocations against a tight limit — verifies reserve-then-allocate
@@ -112,6 +113,11 @@ fn concurrent_tight_limit_no_overcommit() {
         limiter.pod_memory_used(),
         success_count as u64 * alloc_size,
         "SHM accounting mismatch"
+    );
+    assert_eq!(
+        limiter.proc_usage(),
+        success_count as u64 * alloc_size,
+        "proc_usage must match pod_memory_used"
     );
     assert!(success_count > 0, "at least one alloc should succeed");
     // With 16 threads competing for 5 slots, some must be denied
@@ -189,6 +195,7 @@ fn concurrent_native_failures_no_drift() {
 
     assert_eq!(limiter.pod_memory_used(), 0);
     assert_eq!(limiter.allocation_count(), 0);
+    assert_eq!(limiter.proc_usage(), 0, "proc_usage must be 0 after cleanup");
 }
 
 /// Verify that concurrent alloc-only produces consistent accounting.
@@ -226,6 +233,8 @@ fn concurrent_alloc_only_consistency() {
 
     assert_eq!(limiter.allocation_count(), total_pointers);
     assert_eq!(limiter.pod_memory_used(), limiter.tracked_total());
+    assert_eq!(limiter.proc_usage(), limiter.pod_memory_used(),
+        "proc_usage must equal pod_memory_used after concurrent alloc-only");
     assert!(limiter.pod_memory_used() > 0);
 }
 
@@ -313,6 +322,7 @@ fn concurrent_drain_while_allocating() {
     let final_drain = limiter.drain_allocations();
 
     assert_eq!(limiter.pod_memory_used(), 0, "must be 0 after full cleanup");
+    assert_eq!(limiter.proc_usage(), 0, "proc_usage must be 0 after full cleanup");
     assert_eq!(limiter.allocation_count(), 0);
     // final_drain should be 0 since we freed everything manually
     assert_eq!(final_drain, 0, "no allocations should remain after manual free");
@@ -383,7 +393,11 @@ fn concurrent_multi_device_drain() {
     for device in 0..3 {
         assert_eq!(
             limiter.pod_memory_used(device), 0,
-            "device {device} must be 0 after full cleanup"
+            "device {device} pod_memory_used must be 0 after full cleanup"
+        );
+        assert_eq!(
+            limiter.proc_usage(device), 0,
+            "device {device} proc_usage must be 0 after full cleanup"
         );
     }
 }
@@ -451,7 +465,11 @@ fn concurrent_multi_device_consistency() {
     for device_idx in 0..limiter.device_count() {
         assert_eq!(
             limiter.pod_memory_used(device_idx), 0,
-            "device {device_idx} should be 0 after cleanup"
+            "device {device_idx} pod_memory_used should be 0 after cleanup"
+        );
+        assert_eq!(
+            limiter.proc_usage(device_idx), 0,
+            "device {device_idx} proc_usage should be 0 after cleanup"
         );
     }
 }

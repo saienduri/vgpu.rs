@@ -97,8 +97,35 @@ def test_device_total_mem(cts):
     assert "PASS" in result.stdout, f"DeviceTotalMem mismatch: {result.stdout}"
 
 
+def test_device_properties_total_mem(cts):
+    """hipGetDeviceProperties should report totalGlobalMem == SHM-configured mem_limit.
+
+    PyTorch's caching allocator reads device_prop.totalGlobalMem (not hipMemGetInfo)
+    to compute the byte limit for set_per_process_memory_fraction(). If this field
+    isn't spoofed, fraction-based memory limits compute against the real GPU memory
+    (e.g. 256 GiB) instead of the pod limit, breaking OOM tests.
+    """
+    result = cts.run_hip_test("""
+        from hip_helper import HIPRuntime
+
+        hip = HIPRuntime()
+        total = hip.get_device_properties_total_mem(0)
+
+        print(f"total_global_mem={total}")
+
+        expected_limit = 1024 * 1024 * 1024  # 1 GiB
+        if total == expected_limit:
+            print("PASS")
+        else:
+            print(f"FAIL: expected {expected_limit}, got {total}")
+    """)
+    assert result.succeeded, f"Subprocess failed: {result.stderr}"
+    assert "PASS" in result.stdout, f"DeviceProperties totalGlobalMem mismatch: {result.stdout}"
+
+
 def test_spoofed_values_consistent(cts):
-    """hipMemGetInfo total and hipDeviceTotalMem should return the same value."""
+    """hipMemGetInfo total, hipDeviceTotalMem, and hipGetDeviceProperties.totalGlobalMem
+    should all return the same spoofed value."""
     result = cts.run_hip_test("""
         from hip_helper import HIPRuntime
 
@@ -106,14 +133,16 @@ def test_spoofed_values_consistent(cts):
 
         _, mem_get_info_total = hip.mem_get_info()
         device_total = hip.device_total_mem(0)
+        props_total = hip.get_device_properties_total_mem(0)
 
         print(f"mem_get_info_total={mem_get_info_total}")
         print(f"device_total={device_total}")
+        print(f"props_total={props_total}")
 
-        if mem_get_info_total == device_total:
+        if mem_get_info_total == device_total == props_total:
             print("PASS")
         else:
-            print(f"FAIL: memGetInfo total={mem_get_info_total} != deviceTotalMem={device_total}")
+            print(f"FAIL: memGetInfo={mem_get_info_total}, deviceTotalMem={device_total}, props={props_total}")
     """)
     assert result.succeeded, f"Subprocess failed: {result.stderr}"
     assert "PASS" in result.stdout, f"Consistency test failed: {result.stdout}"
@@ -260,6 +289,54 @@ if total_1 != configured_limit:
         )
         assert "DEVICE_1_NOT_SPOOFED" in result.stdout, (
             f"Device 1 (unmapped) hipMemGetInfo should return real total, "
+            f"got:\n{result.stdout}"
+        )
+
+    def test_device_properties_unmapped_returns_real(self, cts_factory):
+        """Configure SHM with only device 0. hipGetDeviceProperties(1).totalGlobalMem
+        should fall through to native since device 1 is not in the limiter's mapping."""
+        fixture = cts_factory(
+            devices=[
+                DeviceSpec(uuid=DEFAULT_TEST_UUID, mem_limit=512 * MiB, device_idx=0),
+            ],
+        )
+
+        configured_limit = 512 * MiB
+        script = f"""\
+from hip_helper import HIPRuntime
+hip = HIPRuntime()
+
+count = hip.get_device_count()
+print(f"DEVICE_COUNT={{count}}")
+if count < 2:
+    print("SKIP")
+    exit(0)
+
+# Device 0 — configured
+props_0 = hip.get_device_properties_total_mem(0)
+print(f"PROPS_0={{props_0}}")
+
+# Device 1 — not configured in SHM
+props_1 = hip.get_device_properties_total_mem(1)
+print(f"PROPS_1={{props_1}}")
+
+configured_limit = {configured_limit}
+if props_0 == configured_limit:
+    print("DEVICE_0_SPOOFED")
+if props_1 != configured_limit:
+    print("DEVICE_1_NOT_SPOOFED")
+"""
+        result = fixture.run_hip_test(script)
+        assert result.succeeded, f"Subprocess failed:\n{result.output}"
+
+        if "SKIP" in result.stdout:
+            pytest.skip("System has fewer than 2 AMD GPUs")
+
+        assert "DEVICE_0_SPOOFED" in result.stdout, (
+            f"Device 0 properties should be spoofed, got:\n{result.stdout}"
+        )
+        assert "DEVICE_1_NOT_SPOOFED" in result.stdout, (
+            f"Device 1 (unmapped) hipGetDeviceProperties should return real total, "
             f"got:\n{result.stdout}"
         )
 

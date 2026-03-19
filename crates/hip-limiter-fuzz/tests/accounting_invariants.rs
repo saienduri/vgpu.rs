@@ -50,6 +50,8 @@ proptest! {
             "allocation_count must match number of live pointers"
         );
         prop_assert_eq!(limiter.pod_memory_used(), limiter.tracked_total());
+        prop_assert_eq!(limiter.proc_usage(), limiter.pod_memory_used(),
+            "proc_usage must equal pod_memory_used in single-threaded scenario");
     }
 
     /// pod_memory_used must never exceed mem_limit in single-threaded usage
@@ -67,6 +69,8 @@ proptest! {
                 limiter.pod_memory_used(),
                 limit
             );
+            prop_assert_eq!(limiter.proc_usage(), limiter.pod_memory_used(),
+                "proc_usage must track pod_memory_used");
         }
     }
 
@@ -89,6 +93,7 @@ proptest! {
         prop_assert_eq!(limiter.pod_memory_used(), 0);
         prop_assert_eq!(limiter.tracked_total(), 0);
         prop_assert_eq!(limiter.allocation_count(), 0);
+        prop_assert_eq!(limiter.proc_usage(), 0, "proc_usage must be 0 after freeing all");
     }
 }
 
@@ -160,6 +165,8 @@ proptest! {
             limiter.tracked_total(),
             "pod_memory_used must equal tracked_total"
         );
+        prop_assert_eq!(limiter.proc_usage(), limiter.pod_memory_used(),
+            "proc_usage must equal pod_memory_used in single-threaded scenario");
     }
 
     /// Pitched allocations must never push pod_memory_used above the limit,
@@ -229,6 +236,7 @@ proptest! {
         prop_assert_eq!(limiter.pod_memory_used(), 0);
         prop_assert_eq!(limiter.tracked_total(), 0);
         prop_assert_eq!(limiter.allocation_count(), 0);
+        prop_assert_eq!(limiter.proc_usage(), 0, "proc_usage must be 0 after freeing all pitched allocs");
     }
 }
 
@@ -287,6 +295,11 @@ proptest! {
                 limiter.pod_memory_used(device_idx),
                 expected,
                 "device {} pod_memory_used mismatch", device_idx
+            );
+            prop_assert_eq!(
+                limiter.proc_usage(device_idx),
+                expected,
+                "device {} proc_usage mismatch", device_idx
             );
         }
     }
@@ -350,6 +363,7 @@ proptest! {
         prop_assert_eq!(limiter.pod_memory_used(), 0, "pod_memory_used must be 0 after drain");
         prop_assert_eq!(limiter.tracked_total(), 0, "tracked_total must be 0 after drain");
         prop_assert_eq!(limiter.allocation_count(), 0, "allocation_count must be 0 after drain");
+        prop_assert_eq!(limiter.proc_usage(), 0, "proc_usage must be 0 after drain");
     }
 
     /// drain_allocations after partial free: alloc N, free some, drain the rest.
@@ -379,6 +393,7 @@ proptest! {
         prop_assert_eq!(drained, used_before_drain);
         prop_assert_eq!(limiter.pod_memory_used(), 0);
         prop_assert_eq!(limiter.allocation_count(), 0);
+        prop_assert_eq!(limiter.proc_usage(), 0, "proc_usage must be 0 after drain");
     }
 
     /// Multi-device drain: random alloc/free across devices, then drain all.
@@ -412,7 +427,11 @@ proptest! {
         for device_idx in 0..3 {
             prop_assert_eq!(
                 limiter.pod_memory_used(device_idx), 0,
-                "device {} must be 0 after drain", device_idx
+                "device {} pod_memory_used must be 0 after drain", device_idx
+            );
+            prop_assert_eq!(
+                limiter.proc_usage(device_idx), 0,
+                "device {} proc_usage must be 0 after drain", device_idx
             );
         }
         // Drain total must be positive if there were any live allocations
@@ -452,10 +471,80 @@ proptest! {
         }
 
         prop_assert_eq!(limiter.pod_memory_used(0), 0, "device 0 should be empty after freeing all");
+        prop_assert_eq!(limiter.proc_usage(0), 0, "device 0 proc_usage should be empty after freeing all");
         prop_assert_eq!(
             limiter.pod_memory_used(1),
             d1_used_before,
             "device 1 must be unchanged after freeing device 0 pointers"
         );
+        prop_assert_eq!(
+            limiter.proc_usage(1),
+            d1_used_before,
+            "device 1 proc_usage must be unchanged after freeing device 0 pointers"
+        );
+    }
+
+    /// Reap-on-OOM on a specific device recovers stale usage and allows retry,
+    /// without affecting other devices.
+    #[test]
+    fn multi_device_reap_on_oom_recovers_stale_device(
+        real_size in 700_000u64..900_000,
+        stale_size in 150_000u64..300_000,
+        alloc_size in 10_000u64..100_000,
+    ) {
+        // Ensure real + stale > limit so the first try_alloc definitely fails
+        // and the reap path is exercised.
+        prop_assume!(real_size + stale_size + alloc_size > 1_000_000);
+
+        let limiter = MultiDeviceSimulatedLimiter::new(&[1_000_000, 1_000_000]);
+
+        // Device 0: real allocation
+        let ptr0 = limiter.try_alloc(0, real_size).unwrap();
+
+        // Device 0: inject stale usage (models dead process)
+        limiter.inject_stale_usage(0, stale_size);
+
+        // Device 1: unrelated allocation — should be untouched
+        let ptr1 = limiter.try_alloc(1, 500_000).unwrap();
+        let d1_before = limiter.pod_memory_used(1);
+
+        // try_alloc_with_reap: first attempt fails (over limit),
+        // reap recovers stale_size, retry may succeed
+        let result = limiter.try_alloc_with_reap(0, alloc_size, |l| {
+            l.recover_stale_usage(0, stale_size);
+            1
+        });
+
+        if real_size + alloc_size <= 1_000_000 {
+            // After reap removed stale, real + alloc fits — should succeed
+            prop_assert!(result.is_ok(), "reap should recover enough for alloc");
+            prop_assert_eq!(
+                limiter.pod_memory_used(0),
+                real_size + alloc_size,
+                "device 0 should reflect real + new alloc (stale recovered)"
+            );
+        } else {
+            // Even after reap, real + alloc > limit — still fails
+            prop_assert!(result.is_err());
+            prop_assert_eq!(
+                limiter.pod_memory_used(0),
+                real_size, // stale was recovered but alloc was denied
+                "device 0 should reflect only real alloc (stale recovered, new denied)"
+            );
+        }
+
+        // Device 1 must be untouched regardless
+        prop_assert_eq!(
+            limiter.pod_memory_used(1),
+            d1_before,
+            "device 1 must be unaffected by device 0 reap"
+        );
+
+        // Cleanup
+        limiter.free(ptr0);
+        limiter.free(ptr1);
+        if let Ok(ptr) = result {
+            limiter.free(ptr);
+        }
     }
 }
