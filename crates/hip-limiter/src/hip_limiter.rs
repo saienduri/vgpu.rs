@@ -20,6 +20,7 @@ use utils::shared_memory::proc_slots::ProcSlotHandle;
 mod config;
 pub(crate) mod detour;
 mod hiplib;
+mod kfd;
 mod limiter;
 mod size_parser;
 
@@ -35,6 +36,10 @@ static CTOR_COMPLETE: AtomicBool = AtomicBool::new(false);
 /// Tracks whether init_hooks() has been attempted (success or failure).
 /// Prevents repeated calls from the dlsym detour when the limiter fails to init.
 static INIT_HOOKS_ATTEMPTED: AtomicBool = AtomicBool::new(false);
+/// BDFs from sysfs enumeration, stored for post-init verification.
+static SYSFS_BDFS: OnceLock<Vec<String>> = OnceLock::new();
+/// Guards one-time post-init verification of sysfs vs HIP device order.
+static SYSFS_VERIFICATION_DONE: AtomicBool = AtomicBool::new(false);
 
 #[ctor]
 unsafe fn entry_point() {
@@ -90,6 +95,18 @@ pub(crate) fn report_limiter_not_initialized() {
     }
 }
 
+/// Run sysfs-vs-HIP verification once, on the first hooked HIP call.
+/// This is deferred from init because calling hipGetDeviceCount during init
+/// would initialize the HIP runtime, breaking fork safety.
+pub(crate) fn maybe_run_sysfs_verification() {
+    if SYSFS_VERIFICATION_DONE.swap(true, Ordering::AcqRel) {
+        return; // Already done
+    }
+    if let Some(sysfs_bdfs) = SYSFS_BDFS.get() {
+        kfd::verify_against_hip(sysfs_bdfs);
+    }
+}
+
 pub(crate) fn mock_shm_path() -> Option<PathBuf> {
     env::var("TF_SHM_FILE")
         .map(PathBuf::from)
@@ -115,10 +132,27 @@ pub(crate) fn resolve_shm_path(standalone: bool) -> String {
     })
 }
 
+/// Result of standalone mode initialization.
+struct StandaloneConfig {
+    pod_config: config::PodConfig,
+    shm_handle: SharedMemoryHandle,
+    proc_slots: ProcSlotHandle,
+    /// Devices from sysfs enumeration; `None` when HIP runtime was used as fallback.
+    pre_enumerated: Option<Vec<limiter::EnumeratedDevice>>,
+}
+
+/// Build a BDF+DeviceConfig pair from a device index and PCI bus ID.
+fn build_standalone_device(
+    index: u32,
+    pci_bdf: String,
+    mem_limit: u64,
+) -> (String, utils::shared_memory::DeviceConfig) {
+    let config = utils::shared_memory::DeviceConfig::memory_only(index, pci_bdf.clone(), mem_limit);
+    (pci_bdf, config)
+}
+
 /// Standalone mode: parse TF_MEMORY_LIMIT, enumerate GPUs, create SHM.
-fn init_standalone_config(
-    mem_limit_str: &str,
-) -> Result<(config::PodConfig, SharedMemoryHandle, ProcSlotHandle), String> {
+fn init_standalone_config(mem_limit_str: &str) -> Result<StandaloneConfig, String> {
     if mock_shm_path().is_some() {
         tracing::warn!("TF_MEMORY_LIMIT is set, ignoring TF_SHM_FILE");
     }
@@ -126,28 +160,61 @@ fn init_standalone_config(
     let mem_limit = size_parser::parse_memory_limit(mem_limit_str)
         .ok_or_else(|| format!("invalid TF_MEMORY_LIMIT value: '{mem_limit_str}'"))?;
 
-    let hip = hiplib::hiplib();
-    let device_count = hip
-        .get_device_count()
-        .map_err(|e| format!("failed to enumerate GPUs: {e}"))?;
+    // Try KFD sysfs first (fork-safe), fall back to HIP runtime.
+    // NOTE: Sysfs does not respect HIP_VISIBLE_DEVICES / ROCR_VISIBLE_DEVICES.
+    // In K8s, GPU restriction is via /dev/dri/renderD* mounting (handled by sysfs
+    // render device check). The post-init verification will log an error if the
+    // sysfs device list diverges from HIP's view.
+    let (gpu_uuids, configs, pre_enumerated) = match kfd::enumerate_gpu_devices() {
+        Ok(devices) => {
+            tracing::info!(
+                device_count = devices.len(),
+                "Standalone mode: enumerated GPUs via KFD sysfs (fork-safe)"
+            );
+            let mut uuids = Vec::with_capacity(devices.len());
+            let mut cfgs = Vec::with_capacity(devices.len());
+            let mut enumerated = Vec::with_capacity(devices.len());
+            for (idx, device) in devices.iter().enumerate() {
+                let (uuid, config) =
+                    build_standalone_device(idx as u32, device.pci_bdf.clone(), mem_limit);
+                enumerated.push((idx as i32, uuid.clone()));
+                uuids.push(uuid);
+                cfgs.push(config);
+            }
+            (uuids, cfgs, Some(enumerated))
+        }
+        Err(e) => {
+            tracing::warn!(
+                "KFD sysfs enumeration failed ({e}), falling back to HIP runtime"
+            );
+            let hip = hiplib::hiplib();
+            let device_count = hip
+                .get_device_count()
+                .map_err(|e| format!("failed to enumerate GPUs: {e}"))?;
 
-    if device_count == 0 {
-        return Err("TF_MEMORY_LIMIT set but no GPUs visible".to_string());
-    }
+            if device_count == 0 {
+                return Err("TF_MEMORY_LIMIT set but no GPUs visible".to_string());
+            }
 
-    let mut gpu_uuids = Vec::with_capacity(device_count as usize);
-    let mut configs = Vec::with_capacity(device_count as usize);
-    for device_index in 0..device_count {
-        let pci_bus_id = hip
-            .get_pci_bus_id(device_index)
-            .map_err(|e| format!("failed to get PCI bus ID for device {device_index}: {e}"))?;
-        gpu_uuids.push(pci_bus_id.clone());
-        configs.push(utils::shared_memory::DeviceConfig::memory_only(
-            device_index as u32,
-            pci_bus_id,
-            mem_limit,
-        ));
-    }
+            let mut uuids = Vec::with_capacity(device_count as usize);
+            let mut cfgs = Vec::with_capacity(device_count as usize);
+            for device_index in 0..device_count {
+                let pci_bus_id = hip
+                    .get_pci_bus_id(device_index)
+                    .map_err(|e| format!("failed to get PCI bus ID for device {device_index}: {e}"))?;
+                let (uuid, config) =
+                    build_standalone_device(device_index as u32, pci_bus_id, mem_limit);
+                uuids.push(uuid);
+                cfgs.push(config);
+            }
+            (uuids, cfgs, None)
+        }
+    };
+
+    debug_assert!(
+        !gpu_uuids.is_empty(),
+        "both sysfs and HIP paths guarantee at least one device"
+    );
 
     let shm_path = resolve_shm_path(true);
     let shm_handle = SharedMemoryHandle::create(&shm_path, &configs)
@@ -159,18 +226,19 @@ fn init_standalone_config(
     tracing::info!(
         mem_limit_bytes = mem_limit,
         mem_limit_str = %mem_limit_str,
-        device_count = device_count,
+        device_count = gpu_uuids.len(),
         "Standalone mode: created SHM with per-GPU limit"
     );
 
-    Ok((
-        config::PodConfig {
+    Ok(StandaloneConfig {
+        pod_config: config::PodConfig {
             gpu_uuids,
             isolation: Some(limiter::ISOLATION_SOFT.to_string()),
         },
         shm_handle,
         proc_slots,
-    ))
+        pre_enumerated,
+    })
 }
 
 /// Production mode: fetch config from hypervisor REST API.
@@ -210,9 +278,9 @@ fn init_limiter() {
         // Config priority: TF_MEMORY_LIMIT (standalone) > TF_SHM_FILE (mock) > hypervisor (prod).
         // Branch order below is standalone → prod → mock because the prod check tests
         // "mock_shm_path is None" (i.e., TF_SHM_FILE is NOT set), with mock as the fallback.
-        let (config, standalone_shm, proc_slots) = if let Ok(mem_limit_str) = env::var("TF_MEMORY_LIMIT") {
+        let (config, standalone_shm, proc_slots, pre_enumerated) = if let Ok(mem_limit_str) = env::var("TF_MEMORY_LIMIT") {
             match init_standalone_config(&mem_limit_str) {
-                Ok((config, shm, proc_slots)) => (config, Some(shm), Some(proc_slots)),
+                Ok(sc) => (sc.pod_config, Some(sc.shm_handle), Some(sc.proc_slots), sc.pre_enumerated),
                 Err(e) => {
                     record_limiter_error(e);
                     return;
@@ -220,7 +288,7 @@ fn init_limiter() {
             }
         } else if mock_shm_path().is_none() {
             match init_production_config() {
-                Ok(config) => (config, None, None),
+                Ok(config) => (config, None, None, None),
                 Err(e) => {
                     record_limiter_error(e);
                     return;
@@ -228,7 +296,7 @@ fn init_limiter() {
             }
         } else {
             match init_mock_config() {
-                Ok(config) => (config, None, None),
+                Ok(config) => (config, None, None, None),
                 Err(e) => {
                     record_limiter_error(e);
                     return;
@@ -238,13 +306,18 @@ fn init_limiter() {
 
         // NOTE: Device visibility is the platform's responsibility (K8s device plugin),
         // not the limiter's. The limiter enforces memory limits via SHM hooks on whichever
-        // GPUs are visible. We do not set HIP_VISIBLE_DEVICES here because init_limiter()
-        // calls hipGetDeviceCount (in standalone mode) before we could set it, and HIP
-        // only reads HIP_VISIBLE_DEVICES at first initialization.
+        // GPUs are visible. We do not set HIP_VISIBLE_DEVICES here because HIP only reads
+        // it at first initialization, and in the HIP fallback path hipGetDeviceCount is
+        // called before we could set it. The sysfs path doesn't respect HIP_VISIBLE_DEVICES
+        // at all (see init_standalone_config comment).
 
         let is_standalone = standalone_shm.is_some();
 
-        let limiter = match Limiter::new(config.gpu_uuids, config.isolation, is_standalone, proc_slots) {
+        let sysfs_bdfs: Option<Vec<String>> = pre_enumerated
+            .as_ref()
+            .map(|devices| devices.iter().map(|(_, bdf)| bdf.clone()).collect());
+
+        let limiter = match Limiter::new(config.gpu_uuids, config.isolation, is_standalone, proc_slots, pre_enumerated) {
             Ok(limiter) => limiter,
             Err(error) => {
                 record_limiter_error(format!("failed to initialize limiter: {error}"));
@@ -264,6 +337,12 @@ fn init_limiter() {
         if GLOBAL_LIMITER.set(limiter).is_err() {
             record_limiter_error("GLOBAL_LIMITER already initialized");
             return;
+        }
+
+        if let Some(bdfs) = sysfs_bdfs {
+            if SYSFS_BDFS.set(bdfs).is_err() {
+                tracing::debug!("SYSFS_BDFS already set");
+            }
         }
 
         // Register atexit handler to drain tracked allocations and decrement

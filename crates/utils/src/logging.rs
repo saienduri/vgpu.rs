@@ -55,7 +55,6 @@ fn file_layer(path: &str) -> Box<dyn Layer<Registry> + Send + Sync> {
     match RollingFileAppender::builder()
         .rotation(Rotation::DAILY)
         .filename_prefix(prefix)
-        .max_log_files(7)
         .build(rotation_dir)
     {
         Ok(appender) => layer()

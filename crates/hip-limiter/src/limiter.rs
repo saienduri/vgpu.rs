@@ -101,24 +101,34 @@ pub(crate) fn resolve_device_indices(
     resolved
 }
 
+/// (HIP device ordinal, PCI Bus/Device/Function address)
+pub(crate) type EnumeratedDevice = (i32, String);
+
 impl Limiter {
+    /// `pre_enumerated`: devices from sysfs; when `Some`, skips HIP runtime calls (fork-safe).
     pub(crate) fn new(
         mut gpu_uuids: Vec<String>,
         isolation: Option<String>,
         standalone: bool,
         proc_slots: Option<ProcSlotHandle>,
+        pre_enumerated: Option<Vec<EnumeratedDevice>>,
     ) -> Result<Self, Error> {
         gpu_uuids.sort();
         gpu_uuids.dedup();
 
-        let hip = hiplib::hiplib();
-        let device_count = hip.get_device_count().map_err(Error::Hip)?;
-
-        let mut enumerated_devices = Vec::new();
-        for device_index in 0..device_count {
-            let pci_bus_id = hip.get_pci_bus_id(device_index).map_err(Error::Hip)?;
-            enumerated_devices.push((device_index, pci_bus_id));
-        }
+        let enumerated_devices = match pre_enumerated {
+            Some(devices) => devices,
+            None => {
+                let hip = hiplib::hiplib();
+                let device_count = hip.get_device_count().map_err(Error::Hip)?;
+                let mut devices = Vec::new();
+                for device_index in 0..device_count {
+                    let pci_bus_id = hip.get_pci_bus_id(device_index).map_err(Error::Hip)?;
+                    devices.push((device_index, pci_bus_id));
+                }
+                devices
+            }
+        };
 
         let gpu_idx_uuids = resolve_device_indices(&gpu_uuids, &enumerated_devices);
 

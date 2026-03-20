@@ -284,3 +284,92 @@ class TestStandaloneEdgeCases:
         output = proc.stdout + proc.stderr
         assert "invalid TF_MEMORY_LIMIT" in output, \
             f"Expected parse error in logs:\nstdout: {proc.stdout}\nstderr: {proc.stderr}"
+
+
+class TestStandaloneForkSafety:
+    """Fork safety: the limiter must not initialize the HIP runtime during standalone init."""
+
+    def test_fork_safety_child_hip_malloc(self):
+        """Verify that fork() after limiter init doesn't break HIP in the child.
+
+        This is the core fork-safety property: the limiter must NOT call
+        hipGetDeviceCount/hipDeviceGetPCIBusId during init (standalone mode),
+        so the child process can use HIP without inheriting stale GPU state.
+        """
+        script = """\
+            import os
+            import sys
+            from hip_helper import HIPRuntime
+
+            # Construct HIPRuntime in parent — this triggers limiter init via LD_PRELOAD
+            hip = HIPRuntime()
+
+            # Fork — child must be able to use HIP
+            pid = os.fork()
+            if pid == 0:
+                # Child process: create a fresh HIPRuntime and use GPU
+                try:
+                    child_hip = HIPRuntime()
+                    count = child_hip.get_device_count()
+                    assert count > 0, "No devices in child"
+
+                    ptr = child_hip.malloc(1024)
+                    assert ptr != 0, "hipMalloc returned null in child"
+
+                    child_hip.free(ptr)
+
+                    print("CHILD_OK")
+                    sys.stdout.flush()
+                    os._exit(0)
+                except Exception as e:
+                    print(f"CHILD_FAIL: {e}", file=sys.stderr)
+                    sys.stderr.flush()
+                    os._exit(1)
+            else:
+                # Parent waits for child
+                _, status = os.waitpid(pid, 0)
+                exit_code = os.waitstatus_to_exitcode(status)
+                assert exit_code == 0, f"Child exited with code {exit_code}"
+                print("PARENT_OK: child fork+HIP succeeded")
+        """
+        result = _run_standalone(script, mem_limit="1G",
+                                 extra_env={"TF_LOG_LEVEL": "hip_limiter=debug",
+                                            "TF_LOG_PATH": "stderr"})
+        assert result.returncode == 0, f"Fork safety test failed:\n{result.stderr}"
+        assert "CHILD_OK" in result.stdout, \
+            f"Child did not succeed:\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        assert "PARENT_OK" in result.stdout, \
+            f"Parent did not confirm child success:\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        # Verify fork safety came from sysfs (not lucky HIP tolerance)
+        output = result.stdout + result.stderr
+        assert "enumerated GPUs via KFD sysfs" in output, \
+            f"Fork safety not via sysfs:\n{output}"
+
+    def _run_with_debug_logs(self, mem_limit="1G"):
+        """Run a minimal standalone script with debug logging to stderr."""
+        script = """\
+            from hip_helper import HIPRuntime
+            hip = HIPRuntime()
+            ptr = hip.malloc(1024)
+            hip.free(ptr)
+            print("PASS")
+        """
+        result = _run_standalone(script, mem_limit=mem_limit,
+                                 extra_env={"TF_LOG_LEVEL": "hip_limiter=debug",
+                                            "TF_LOG_PATH": "stderr"})
+        assert result.returncode == 0, f"Failed: {result.stderr}"
+        return result.stdout + result.stderr
+
+    def test_sysfs_enumeration_used(self):
+        """Verify standalone mode uses KFD sysfs enumeration (not HIP runtime)."""
+        output = self._run_with_debug_logs()
+        assert "enumerated GPUs via KFD sysfs" in output, \
+            f"Expected sysfs enumeration log:\n{output}"
+
+    def test_post_init_verification_runs(self):
+        """Verify the one-time sysfs-vs-HIP verification runs and devices agree."""
+        output = self._run_with_debug_logs()
+        assert "DEVICE MISMATCH" not in output, \
+            f"Sysfs/HIP device mismatch detected:\n{output}"
+        assert "sysfs matches HIP device order" in output, \
+            f"Expected verification log:\n{output}"

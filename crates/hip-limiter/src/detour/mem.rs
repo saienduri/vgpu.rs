@@ -102,26 +102,33 @@ fn handle_reserve_error(error: Error, alloc_name: &str) -> HipError {
 macro_rules! check_and_alloc {
     ($out_ptr:expr, $request_size:expr, $alloc_name:expr, $alloc_fn:expr) => {{
         match with_device!() {
-            Ok((limiter, device_idx)) => match limiter.try_reserve(device_idx, $request_size) {
-                Ok(_previous_used) => {
-                    // Reservation succeeded — call the native allocator
-                    let result = $alloc_fn();
-                    if result == HIP_SUCCESS && $request_size > 0 {
-                        let allocated_ptr = *$out_ptr as usize;
-                        if allocated_ptr != 0 {
-                            limiter.record_allocation(device_idx, allocated_ptr, $request_size);
-                        } else {
-                            // Native allocator returned success but null pointer — roll back reservation
+            Ok((limiter, device_idx)) => {
+                // One-time deferred verification: compare sysfs BDFs vs HIP.
+                // Must run here (on first hooked HIP call), not during init,
+                // because init runs pre-fork and hipGetDeviceCount would poison fork.
+                $crate::maybe_run_sysfs_verification();
+
+                match limiter.try_reserve(device_idx, $request_size) {
+                    Ok(_previous_used) => {
+                        // Reservation succeeded — call the native allocator
+                        let result = $alloc_fn();
+                        if result == HIP_SUCCESS && $request_size > 0 {
+                            let allocated_ptr = *$out_ptr as usize;
+                            if allocated_ptr != 0 {
+                                limiter.record_allocation(device_idx, allocated_ptr, $request_size);
+                            } else {
+                                // Native allocator returned success but null pointer — roll back reservation
+                                limiter.rollback_reservation(device_idx, $request_size);
+                            }
+                        } else if result != HIP_SUCCESS && $request_size > 0 {
+                            // Native alloc failed — roll back the reservation
                             limiter.rollback_reservation(device_idx, $request_size);
                         }
-                    } else if result != HIP_SUCCESS && $request_size > 0 {
-                        // Native alloc failed — roll back the reservation
-                        limiter.rollback_reservation(device_idx, $request_size);
+                        result
                     }
-                    result
+                    Err(error) => handle_reserve_error(error, $alloc_name),
                 }
-                Err(error) => handle_reserve_error(error, $alloc_name),
-            },
+            }
             Err(error) => {
                 tracing::warn!("Device context error: {error}, falling back to native call");
                 $alloc_fn()
