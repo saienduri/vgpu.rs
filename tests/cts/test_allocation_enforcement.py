@@ -156,6 +156,11 @@ def test_alloc_after_free(cts):
     assert "PASS" in result.stdout, f"Alloc-after-free test failed: {result.stdout}"
 
 
+# Each variant is tested for both success-within-limit and OOM-over-limit.
+# hipMallocManaged, hipMallocAsync, hipMallocFromPoolAsync, and hipMemCreate
+# are also regression canaries for the dlsym LD_PRELOAD override: if CStr/strlen
+# is called in the dlsym fast path, dynamic linker re-entrancy corrupts HSA vmem
+# and these four variants fail with hipErrorOutOfMemory even within limits.
 ALLOC_VARIANT_SCRIPTS = {
     "hipMalloc": """\
 from hip_helper import HIPRuntime, HIP_SUCCESS

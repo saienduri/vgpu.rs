@@ -10,10 +10,8 @@ use std::sync::OnceLock;
 
 use ctor::ctor;
 use limiter::Limiter;
-use tf_macro::hook_fn;
 use utils::hooks::HookManager;
 use utils::logging;
-use utils::replace_symbol;
 use utils::shared_memory::handle::SharedMemoryHandle;
 use utils::shared_memory::proc_slots::ProcSlotHandle;
 
@@ -23,6 +21,35 @@ mod hiplib;
 mod kfd;
 mod limiter;
 mod size_parser;
+
+/// The real `dlsym` function pointer, resolved once via `dlvsym(RTLD_NEXT)`.
+///
+/// Our `#[no_mangle] dlsym` export overrides the PLT entry, so calling
+/// `libc::dlsym` directly would recurse into our override. We break the
+/// cycle by resolving the real dlsym through `dlvsym` with an explicit
+/// GLIBC version, which is not overridden.
+static REAL_DLSYM: OnceLock<unsafe extern "C" fn(*mut c_void, *const c_char) -> *mut c_void> =
+    OnceLock::new();
+
+extern "C" {
+    fn dlvsym(handle: *mut c_void, symbol: *const c_char, version: *const c_char) -> *mut c_void;
+}
+
+/// Resolve the real `dlsym` function pointer. Called once, result is cached.
+/// Uses `dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.2.5")` which is not subject to
+/// our LD_PRELOAD override.
+pub(crate) unsafe fn real_dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void {
+    let real_fn = REAL_DLSYM.get_or_init(|| {
+        let ptr = dlvsym(
+            libc::RTLD_NEXT,
+            c"dlsym".as_ptr(),
+            c"GLIBC_2.2.5".as_ptr(),
+        );
+        assert!(!ptr.is_null(), "dlvsym failed to resolve real dlsym");
+        std::mem::transmute(ptr)
+    });
+    real_fn(handle, symbol)
+}
 
 static GLOBAL_LIMITER: OnceLock<Limiter> = OnceLock::new();
 static GLOBAL_LIMITER_ERROR: OnceLock<String> = OnceLock::new();
@@ -47,9 +74,10 @@ unsafe fn entry_point() {
     // subscriber during .init_array corrupts HIP/ROCr internal state, causing
     // rocFFT's JIT kernel compilation to fail with HIPFFT_PARSE_ERROR.
     //
-    // Instead, install only the dlsym Frida hook (lightweight, no logging needed).
     // Full initialization (logging + limiter + HIP hooks) is deferred to the first
-    // HIP/SMI symbol lookup via the dlsym detour, AFTER .init_array completes.
+    // HIP/SMI symbol lookup via the #[no_mangle] dlsym override, AFTER .init_array
+    // completes. The dlsym override is active automatically via LD_PRELOAD — no
+    // explicit installation needed.
     let enable_hip_hooks = env::var("ENABLE_HIP_HOOKS")
         .map(|value| value != "false")
         .unwrap_or(true);
@@ -61,7 +89,6 @@ unsafe fn entry_point() {
         return;
     }
 
-    install_dlsym_hook();
     CTOR_COMPLETE.store(true, Ordering::Release);
 }
 
@@ -465,55 +492,61 @@ fn init_hooks() {
         try_install_hip_hooks();
     }
 
-    install_dlsym_hook();
     tracing::debug!("Hook initialization completed");
-}
-
-/// Install just the dlsym Frida hook (lightweight, no logging init required).
-/// Called from the ctor (before logging is safe) and from init_hooks().
-/// The dlsym hook triggers full init_hooks() when HIP symbols are first resolved.
-fn install_dlsym_hook() {
-    static DLSYM_HOOK_ONCE: Once = Once::new();
-    DLSYM_HOOK_ONCE.call_once(|| {
-        let mut hook_manager = HookManager::default();
-        if let Err(error) = replace_symbol!(
-            &mut hook_manager,
-            None,
-            "dlsym",
-            dlsym_detour,
-            FnDlsym,
-            FN_DLSYM
-        ) {
-            // Use eprintln — logging may not be initialized yet when called from the ctor.
-            eprintln!("[hip-limiter] Failed to install dlsym hook: {error}");
-        }
-    });
 }
 
 thread_local! {
     static IN_DLSYM_DETOUR: Cell<bool> = const { Cell::new(false) };
 }
 
-fn call_original_dlsym(handle: *const c_void, symbol: *const c_char) -> *const c_void {
-    if let Some(original) = FN_DLSYM.get() {
-        unsafe { original(handle, symbol) }
-    } else {
-        unsafe { libc::dlsym(handle as *mut c_void, symbol) }
-    }
+fn call_original_dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void {
+    unsafe { real_dlsym(handle, symbol) }
 }
 
-#[hook_fn]
-unsafe extern "C" fn dlsym_detour(handle: *const c_void, symbol: *const c_char) -> *const c_void {
+/// Check if a NUL-terminated C string starts with the given prefix by reading
+/// raw bytes. Does NOT call `strlen` or any PLT-resolved function.
+///
+/// # Safety
+///
+/// `ptr` must point to a valid NUL-terminated C string. The NUL terminator
+/// guarantees short-circuit safety: for a string shorter than `prefix`, the
+/// loop hits `\0 != expected_byte` and returns `false` before reading past
+/// the string's allocation.
+#[inline(always)]
+unsafe fn cstr_starts_with(ptr: *const c_char, prefix: &[u8]) -> bool {
+    debug_assert!(!prefix.is_empty());
+    let p = ptr as *const u8;
+    for (i, &expected) in prefix.iter().enumerate() {
+        if *p.add(i) != expected {
+            return false;
+        }
+    }
+    true
+}
+
+/// LD_PRELOAD symbol override for `dlsym`.
+///
+/// The dynamic linker resolves all `dlsym` calls to this function automatically
+/// because the limiter .so is loaded via LD_PRELOAD. No Frida code patching needed.
+///
+/// This serves two purposes:
+/// 1. Lazy init trigger — first HIP/SMI symbol lookup after ctor triggers `init_hooks()`
+/// 2. SMI interception — returns our spoofed function pointers for rocm-smi/amd-smi symbols
+///
+/// IMPORTANT: This function must NOT call `strlen`, `CStr::from_ptr`, or any libc
+/// function resolved via PLT on every invocation. Doing so triggers dynamic linker
+/// re-entrancy during early process startup, corrupting HSA vmem state and causing
+/// hipMallocManaged/hipMallocAsync/hipMemCreate to fail with OOM. Use
+/// [`cstr_starts_with`] for prefix matching instead.
+#[no_mangle]
+pub unsafe extern "C" fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void {
     if symbol.is_null() {
         return call_original_dlsym(handle, symbol);
     }
 
-    let Ok(symbol_str) = CStr::from_ptr(symbol).to_str() else {
-        return call_original_dlsym(handle, symbol);
-    };
-
-    let is_hip_symbol = symbol_str.starts_with("hip");
-    let is_smi_symbol = symbol_str.starts_with("rsmi_") || symbol_str.starts_with("amdsmi_");
+    let is_hip_symbol = cstr_starts_with(symbol, b"hip");
+    let is_smi_symbol =
+        cstr_starts_with(symbol, b"rsmi_") || cstr_starts_with(symbol, b"amdsmi_");
 
     if !is_hip_symbol && !is_smi_symbol {
         return call_original_dlsym(handle, symbol);
@@ -549,15 +582,141 @@ unsafe extern "C" fn dlsym_detour(handle: *const c_void, symbol: *const c_char) 
     }
 
     // For SMI symbols, intercept at the dlsym level: resolve the original
-    // address and return our detour's address. This avoids Frida reentrancy
-    // issues when installing hooks from within the dlsym detour.
+    // address and return our detour's address so callers invoke our hook directly.
+    // CStr::from_ptr is safe here — SMI lookups happen after initialization, not
+    // during early startup when dynamic linker re-entrancy is a concern.
     let original = call_original_dlsym(handle, symbol);
     if is_smi_symbol && !original.is_null() {
-        if let Some(detour) = detour::smi::try_intercept_smi_symbol(symbol_str, original) {
-            return detour;
+        let symbol_str = CStr::from_ptr(symbol).to_str().unwrap_or("");
+        if let Some(detour) = detour::smi::try_intercept_smi_symbol(symbol_str, original as *const c_void) {
+            return detour as *mut c_void;
         }
     }
 
     original
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CString;
+
+    /// Helper: run cstr_starts_with on a Rust string.
+    fn starts_with(s: &str, prefix: &[u8]) -> bool {
+        let cs = CString::new(s).unwrap();
+        unsafe { cstr_starts_with(cs.as_ptr(), prefix) }
+    }
+
+    // --- cstr_starts_with correctness ---
+
+    #[test]
+    fn test_cstr_starts_with_exact_match() {
+        assert!(starts_with("hip", b"hip"));
+        assert!(starts_with("rsmi_", b"rsmi_"));
+        assert!(starts_with("amdsmi_", b"amdsmi_"));
+    }
+
+    #[test]
+    fn test_cstr_starts_with_longer_string() {
+        assert!(starts_with("hipMalloc", b"hip"));
+        assert!(starts_with("rsmi_dev_memory_total_get", b"rsmi_"));
+        assert!(starts_with("amdsmi_get_gpu_memory_total", b"amdsmi_"));
+    }
+
+    #[test]
+    fn test_cstr_starts_with_no_match() {
+        assert!(!starts_with("pthread_create", b"hip"));
+        assert!(!starts_with("dlopen", b"rsmi_"));
+        assert!(!starts_with("cudaMalloc", b"amdsmi_"));
+    }
+
+    #[test]
+    fn test_cstr_starts_with_short_strings() {
+        // Strings shorter than prefix — NUL terminator causes mismatch.
+        assert!(!starts_with("h", b"hip"));
+        assert!(!starts_with("hi", b"hip"));
+        assert!(!starts_with("rs", b"rsmi_"));
+        assert!(!starts_with("a", b"amdsmi_"));
+        assert!(!starts_with("am", b"amdsmi_"));
+        assert!(!starts_with("amdsmi", b"amdsmi_"));
+    }
+
+    #[test]
+    fn test_cstr_starts_with_empty_string() {
+        assert!(!starts_with("", b"hip"));
+        assert!(!starts_with("", b"rsmi_"));
+    }
+
+    #[test]
+    fn test_cstr_starts_with_single_byte_prefix() {
+        assert!(starts_with("hipMalloc", b"h"));
+        assert!(!starts_with("malloc", b"h"));
+    }
+
+    // --- dlsym symbol classification (integration of cstr_starts_with) ---
+
+    /// Classify a symbol the same way the dlsym override does.
+    fn classify(s: &str) -> (bool, bool) {
+        let cs = CString::new(s).unwrap();
+        let ptr = cs.as_ptr();
+        unsafe {
+            let is_hip = cstr_starts_with(ptr, b"hip");
+            let is_smi = cstr_starts_with(ptr, b"rsmi_") || cstr_starts_with(ptr, b"amdsmi_");
+            (is_hip, is_smi)
+        }
+    }
+
+    #[test]
+    fn test_classify_hip_symbols() {
+        assert_eq!(classify("hipMalloc"), (true, false));
+        assert_eq!(classify("hipMallocManaged"), (true, false));
+        assert_eq!(classify("hipFree"), (true, false));
+        assert_eq!(classify("hipMemGetInfo"), (true, false));
+    }
+
+    #[test]
+    fn test_classify_smi_symbols() {
+        assert_eq!(classify("rsmi_dev_memory_total_get"), (false, true));
+        assert_eq!(classify("amdsmi_get_gpu_memory_total"), (false, true));
+        assert_eq!(classify("amdsmi_get_gpu_vram_info"), (false, true));
+    }
+
+    #[test]
+    fn test_classify_unrelated_symbols() {
+        assert_eq!(classify("pthread_create"), (false, false));
+        assert_eq!(classify("malloc"), (false, false));
+        assert_eq!(classify("dlopen"), (false, false));
+        assert_eq!(classify(""), (false, false));
+        assert_eq!(classify("h"), (false, false));
+    }
+
+    // --- regression guard: prevent reintroduction of CStr/strlen in dlsym fast path ---
+
+    #[test]
+    fn test_no_cstr_in_dlsym_fast_path() {
+        // CStr::from_ptr calls strlen, which triggers dynamic linker re-entrancy
+        // during early startup, corrupting HSA vmem and causing hipMallocManaged/
+        // hipMallocAsync/hipMemCreate to fail with OOM. CStr::from_ptr is only
+        // safe AFTER the `is_smi_symbol` check (post-initialization lookups).
+        // This test ensures no one adds it back in the fast path.
+        let source = include_str!("hip_limiter.rs");
+        let dlsym_start = source
+            .find("pub unsafe extern \"C\" fn dlsym(")
+            .expect("dlsym function not found");
+        let smi_branch_offset = source[dlsym_start..]
+            .find("if is_smi_symbol")
+            .expect("is_smi_symbol branch not found");
+        let fast_path = &source[dlsym_start..dlsym_start + smi_branch_offset];
+        // Check non-comment lines only — doc comments legitimately mention CStr::from_ptr.
+        let has_cstr_code = fast_path.lines().any(|line| {
+            let trimmed = line.trim();
+            !trimmed.starts_with("//") && trimmed.contains("CStr::from_ptr")
+        });
+        assert!(
+            !has_cstr_code,
+            "CStr::from_ptr must not appear in the dlsym fast path (before is_smi_symbol check). \
+             It calls strlen via PLT, causing dynamic linker re-entrancy. \
+             Use cstr_starts_with instead."
+        );
+    }
+}

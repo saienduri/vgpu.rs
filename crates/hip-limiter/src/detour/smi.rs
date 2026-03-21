@@ -115,7 +115,7 @@ unsafe fn resolve_bdf_fn_from_lib(known_addr: *const c_void) -> Option<FnAmdSmiG
         return None;
     }
 
-    let ptr = libc::dlsym(handle, c"amdsmi_get_gpu_device_bdf".as_ptr());
+    let ptr = crate::real_dlsym(handle, c"amdsmi_get_gpu_device_bdf".as_ptr());
     // Don't dlclose — on glibc, dlopen(RTLD_NOLOAD) increments the refcount,
     // so dlclose would decrement it. Omitting dlclose leaves the refcount
     // unmodified, which is safe since the caller (Python) holds the library loaded.
@@ -254,10 +254,10 @@ pub(crate) unsafe extern "C" fn amdsmi_get_gpu_vram_info_detour(
 
 /// Intercept an SMI symbol at the dlsym level.
 ///
-/// When a library is loaded dynamically (e.g., Python ctypes), Frida inline
-/// hooks installed from within the dlsym detour may not take effect. Instead,
-/// we intercept at the dlsym level: store the original function pointer and
-/// return our detour's address so callers invoke our hook directly.
+/// SMI libraries (rocm-smi, amd-smi) are loaded dynamically at runtime via
+/// `dlopen`/`dlsym` (e.g., Python ctypes). Our LD_PRELOAD `dlsym` override
+/// intercepts these lookups: we store the original function pointer and return
+/// our detour's address so callers invoke our hook directly.
 ///
 /// Returns `Some(detour_addr)` if we want to intercept this symbol,
 /// or `None` to pass through the original.
