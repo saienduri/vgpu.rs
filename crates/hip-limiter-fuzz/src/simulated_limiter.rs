@@ -2,26 +2,11 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use dashmap::DashMap;
 
+use crate::saturating_fetch_sub;
+
 /// Maximum single allocation size — rejects before fetch_add to prevent
 /// transient wrapping of the atomic counter.
 const MAX_ALLOC_SIZE: u64 = u64::MAX / 2;
-
-/// Atomically subtract `size` from `counter`, clamping at zero.
-///
-/// Uses a CAS loop to prevent underflow wrapping. Mirrors
-/// `saturating_fetch_sub_pod_memory_used` on `SharedDeviceInfoV2`.
-fn saturating_fetch_sub(counter: &AtomicU64, size: u64) {
-    loop {
-        let current = counter.load(Ordering::Acquire);
-        let new_value = current.saturating_sub(size);
-        if counter
-            .compare_exchange_weak(current, new_value, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            break;
-        }
-    }
-}
 
 /// Pure-Rust model of the hip-limiter's memory accounting logic.
 ///
@@ -39,6 +24,9 @@ fn saturating_fetch_sub(counter: &AtomicU64, size: u64) {
 /// because `mem_limit == 0` is not a valid production configuration.
 pub struct SimulatedLimiter {
     mem_limit: u64,
+    /// Mirrors the SHM `effective_mem_limit` — tighter limit accounting for non-hipMalloc overhead.
+    /// Value of 0 means "not yet computed" — try_alloc falls back to mem_limit.
+    effective_mem_limit: AtomicU64,
     /// Mirrors the SHM `pod_memory_used` atomic counter.
     /// Updated via `fetch_add` on alloc and `fetch_sub` on free.
     pod_memory_used: AtomicU64,
@@ -57,6 +45,7 @@ impl SimulatedLimiter {
     pub fn new(mem_limit: u64) -> Self {
         Self {
             mem_limit,
+            effective_mem_limit: AtomicU64::new(0),
             pod_memory_used: AtomicU64::new(0),
             proc_usage: AtomicU64::new(0),
             allocation_tracker: DashMap::new(),
@@ -92,7 +81,7 @@ impl SimulatedLimiter {
         let previous_used = self.pod_memory_used.fetch_add(size, Ordering::AcqRel);
         let new_used = previous_used.saturating_add(size);
 
-        if new_used > self.mem_limit {
+        if new_used > self.active_limit() {
             // Over limit — roll back the reservation
             self.saturating_sub_pod_memory_used(size);
             return Err(());
@@ -138,6 +127,17 @@ impl SimulatedLimiter {
     /// Returns the configured memory limit.
     pub fn mem_limit(&self) -> u64 {
         self.mem_limit
+    }
+
+    /// Set the effective memory limit (tighter limit accounting for non-hipMalloc overhead).
+    /// A value of 0 means "not yet computed" — try_alloc falls back to mem_limit.
+    pub fn set_effective_mem_limit(&self, limit: u64) {
+        self.effective_mem_limit.store(limit, Ordering::Release);
+    }
+
+    /// Returns the current effective memory limit (0 means "use mem_limit").
+    pub fn effective_mem_limit(&self) -> u64 {
+        self.effective_mem_limit.load(Ordering::Acquire)
     }
 
     /// Returns the current per-PID usage (mirrors ProcSlot `used[device_idx]`).
@@ -187,6 +187,13 @@ impl SimulatedLimiter {
         }
     }
 
+    /// The enforcement limit: effective_mem_limit when non-zero, otherwise mem_limit.
+    /// Mirrors `limiter.rs:409`.
+    fn active_limit(&self) -> u64 {
+        let effective = self.effective_mem_limit.load(Ordering::Acquire);
+        if effective > 0 { effective } else { self.mem_limit }
+    }
+
     fn saturating_sub_pod_memory_used(&self, size: u64) {
         saturating_fetch_sub(&self.pod_memory_used, size);
     }
@@ -227,7 +234,7 @@ impl SimulatedLimiter {
         let previous_used = self.pod_memory_used.fetch_add(estimated_size, Ordering::AcqRel);
         let new_used = previous_used.saturating_add(estimated_size);
 
-        if new_used > self.mem_limit {
+        if new_used > self.active_limit() {
             self.saturating_sub_pod_memory_used(estimated_size);
             return Err(());
         }
@@ -245,7 +252,7 @@ impl SimulatedLimiter {
             let prev = self.pod_memory_used.fetch_add(extra, Ordering::AcqRel);
             let new_total = prev.saturating_add(extra);
 
-            if new_total > self.mem_limit {
+            if new_total > self.active_limit() {
                 // Extra overhead pushes over limit — rollback everything
                 // (estimated_size + extra = actual_size, rolled back in one op)
                 self.saturating_sub_pod_memory_used(estimated_size + extra);
@@ -306,7 +313,7 @@ impl SimulatedLimiter {
         let previous_used = self.pod_memory_used.fetch_add(size, Ordering::AcqRel);
         let new_used = previous_used.saturating_add(size);
 
-        if new_used > self.mem_limit {
+        if new_used > self.active_limit() {
             // Over limit — roll back
             self.saturating_sub_pod_memory_used(size);
             return Err(());
@@ -395,6 +402,16 @@ impl MultiDeviceSimulatedLimiter {
         self.devices[device_idx].proc_usage()
     }
 
+    /// Set the effective memory limit for a specific device.
+    pub fn set_effective_mem_limit(&self, device_idx: usize, limit: u64) {
+        self.devices[device_idx].set_effective_mem_limit(limit);
+    }
+
+    /// Returns the effective memory limit for a specific device.
+    pub fn effective_mem_limit(&self, device_idx: usize) -> u64 {
+        self.devices[device_idx].effective_mem_limit()
+    }
+
     /// Inject stale usage on a specific device (models dead process).
     pub fn inject_stale_usage(&self, device_idx: usize, size: u64) {
         self.devices[device_idx].inject_stale_usage(size);
@@ -459,5 +476,90 @@ mod tests {
         assert!(!limiter.free(ptr1), "free of zero-size pointer returns false");
         assert!(!limiter.free(ptr2), "free of zero-size pointer returns false");
         assert_eq!(limiter.pod_memory_used(), 0, "free of untracked pointer is noop");
+    }
+
+    /// When effective_mem_limit is set (non-zero), it gates allocations instead of mem_limit.
+    #[test]
+    fn effective_limit_gates_alloc() {
+        let limiter = SimulatedLimiter::new(1000);
+        limiter.set_effective_mem_limit(500);
+
+        let ptr = limiter.try_alloc(400).expect("400 < 500 effective limit");
+        assert_eq!(limiter.pod_memory_used(), 400);
+
+        // 400 + 200 = 600 > 500 effective limit — should be denied
+        assert!(limiter.try_alloc(200).is_err(), "600 > 500 effective limit");
+        assert_eq!(limiter.pod_memory_used(), 400, "denied alloc must not change counter");
+
+        limiter.free(ptr);
+    }
+
+    /// When effective_mem_limit is 0 (not yet computed), try_alloc falls back to mem_limit.
+    #[test]
+    fn effective_limit_zero_uses_mem_limit() {
+        let limiter = SimulatedLimiter::new(1000);
+        assert_eq!(limiter.effective_mem_limit(), 0);
+
+        // Should be able to allocate up to mem_limit
+        let ptr = limiter.try_alloc(900).expect("900 < 1000 mem_limit");
+        assert_eq!(limiter.pod_memory_used(), 900);
+
+        // 900 + 200 = 1100 > 1000 mem_limit — denied
+        assert!(limiter.try_alloc(200).is_err());
+
+        limiter.free(ptr);
+    }
+
+    /// effective_mem_limit can be updated dynamically, and subsequent allocs use the new value.
+    #[test]
+    fn effective_limit_dynamic_update() {
+        let limiter = SimulatedLimiter::new(1000);
+        limiter.set_effective_mem_limit(500);
+
+        let ptr1 = limiter.try_alloc(400).expect("400 < 500");
+        assert_eq!(limiter.pod_memory_used(), 400);
+
+        // 400 + 300 = 700 > 500 — denied
+        assert!(limiter.try_alloc(300).is_err());
+
+        // Raise effective limit to 800
+        limiter.set_effective_mem_limit(800);
+
+        // Now 400 + 300 = 700 < 800 — should succeed
+        let ptr2 = limiter.try_alloc(300).expect("700 < 800 new effective limit");
+        assert_eq!(limiter.pod_memory_used(), 700);
+
+        limiter.free(ptr1);
+        limiter.free(ptr2);
+    }
+
+    /// Each device in a multi-device limiter has its own effective_mem_limit.
+    #[test]
+    fn multi_device_effective_limit() {
+        let limiter = MultiDeviceSimulatedLimiter::new(&[1000, 2000]);
+
+        // Set different effective limits per device
+        limiter.set_effective_mem_limit(0, 500);
+        limiter.set_effective_mem_limit(1, 1500);
+
+        assert_eq!(limiter.effective_mem_limit(0), 500);
+        assert_eq!(limiter.effective_mem_limit(1), 1500);
+
+        // Device 0: 400 < 500 — succeeds
+        let ptr0 = limiter.try_alloc(0, 400).expect("device 0: 400 < 500");
+        assert_eq!(limiter.pod_memory_used(0), 400);
+
+        // Device 0: 400 + 200 = 600 > 500 — denied
+        assert!(limiter.try_alloc(0, 200).is_err(), "device 0: 600 > 500");
+
+        // Device 1: 1200 < 1500 — succeeds (independent of device 0)
+        let ptr1 = limiter.try_alloc(1, 1200).expect("device 1: 1200 < 1500");
+        assert_eq!(limiter.pod_memory_used(1), 1200);
+
+        // Device 1: 1200 + 400 = 1600 > 1500 — denied
+        assert!(limiter.try_alloc(1, 400).is_err(), "device 1: 1600 > 1500");
+
+        limiter.free(ptr0);
+        limiter.free(ptr1);
     }
 }

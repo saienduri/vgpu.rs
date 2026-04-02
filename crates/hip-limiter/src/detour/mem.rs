@@ -237,7 +237,7 @@ macro_rules! check_and_alloc_pitched {
 /// Multiplies all dimensions via checked arithmetic, then applies the MAX_ALLOC_SIZE
 /// guard (u64::MAX / 2) to prevent transient wrapping of the atomic counter.
 /// Returns `None` if any dimension overflows or the result exceeds the guard.
-fn checked_pitched_size(dims: &[usize]) -> Option<u64> {
+pub(crate) fn checked_pitched_size(dims: &[usize]) -> Option<u64> {
     let size = dims.iter().copied().try_fold(1usize, usize::checked_mul)?;
     if size <= u64::MAX as usize / 2 {
         Some(size as u64)
@@ -248,7 +248,7 @@ fn checked_pitched_size(dims: &[usize]) -> Option<u64> {
 
 /// Bytes per element for a `hipArray_Format` enum value.
 /// Returns `None` for unrecognized format values.
-fn array_format_bytes(format: c_int) -> Option<u64> {
+pub(crate) fn array_format_bytes(format: c_int) -> Option<u64> {
     match format {
         0x01 | 0x08 => Some(1), // UNSIGNED_INT8, SIGNED_INT8
         0x02 | 0x09 | 0x10 => Some(2), // UNSIGNED_INT16, SIGNED_INT16, HALF
@@ -259,7 +259,7 @@ fn array_format_bytes(format: c_int) -> Option<u64> {
 
 /// Bytes per element from a `hipChannelFormatDesc` (sum of x/y/z/w bit widths / 8).
 /// Returns `None` on negative widths, zero total bits, or non-byte-aligned bits.
-fn channel_desc_bytes_per_elem(desc: &HipChannelFormatDesc) -> Option<u64> {
+pub(crate) fn channel_desc_bytes_per_elem(desc: &HipChannelFormatDesc) -> Option<u64> {
     if desc.x < 0 || desc.y < 0 || desc.z < 0 || desc.w < 0 {
         return None;
     }
@@ -272,7 +272,7 @@ fn channel_desc_bytes_per_elem(desc: &HipChannelFormatDesc) -> Option<u64> {
 
 /// Compute allocation size for runtime API array descriptors (hipChannelFormatDesc).
 /// Returns `None` on invalid descriptor, overflow, or size > u64::MAX/2.
-fn channel_desc_alloc_size(
+pub(crate) fn channel_desc_alloc_size(
     desc: &HipChannelFormatDesc, width: usize, height: usize, depth: usize,
 ) -> Option<u64> {
     let bytes_per_elem = channel_desc_bytes_per_elem(desc)?;
@@ -287,7 +287,7 @@ fn channel_desc_alloc_size(
 
 /// Compute allocation size for driver API array descriptors (HIP_ARRAY_DESCRIPTOR / HIP_ARRAY3D_DESCRIPTOR).
 /// Returns `None` on unknown format, overflow, or size > u64::MAX/2.
-fn driver_array_alloc_size(
+pub(crate) fn driver_array_alloc_size(
     format: c_int, num_channels: c_uint, width: usize, height: usize, depth: usize,
 ) -> Option<u64> {
     let elem_bytes = array_format_bytes(format)?;
@@ -314,7 +314,7 @@ fn driver_array_alloc_size(
 /// `num_levels` is capped at 32 to prevent pathological iteration. The maximum
 /// meaningful mip level count for the largest supported texture dimension (65536) is
 /// `floor(log2(65536)) + 1 = 17`, so 32 is generous while still bounded.
-fn mip_chain_total_size(
+pub(crate) fn mip_chain_total_size(
     bytes_per_elem: u64, width: usize, height: usize, depth: usize, num_levels: u32,
 ) -> Option<u64> {
     const MAX_MIP_LEVELS: u32 = 32;
@@ -1414,5 +1414,56 @@ mod tests {
     #[test]
     fn test_bytes_per_elem_zero() {
         assert_eq!(channel_desc_bytes_per_elem(&make_desc(0, 0, 0, 0)), None);
+    }
+
+    // --- checked_pitched_size ---
+
+    #[test]
+    fn test_pitched_normal_2d() {
+        // 1024 * 768 = 786432
+        assert_eq!(checked_pitched_size(&[1024, 768]), Some(786432));
+    }
+
+    #[test]
+    fn test_pitched_empty_dims() {
+        // Empty slice: fold starts at 1, no multiplications
+        assert_eq!(checked_pitched_size(&[]), Some(1));
+    }
+
+    #[test]
+    fn test_pitched_single_dim() {
+        assert_eq!(checked_pitched_size(&[4096]), Some(4096));
+    }
+
+    #[test]
+    fn test_pitched_3d() {
+        // 256 * 256 * 256 = 16777216
+        assert_eq!(checked_pitched_size(&[256, 256, 256]), Some(16_777_216));
+    }
+
+    #[test]
+    fn test_pitched_contains_zero() {
+        assert_eq!(checked_pitched_size(&[1024, 0, 768]), Some(0));
+    }
+
+    #[test]
+    fn test_pitched_overflow() {
+        // usize::MAX * 2 overflows checked_mul
+        assert_eq!(checked_pitched_size(&[usize::MAX, 2]), None);
+    }
+
+    #[test]
+    fn test_pitched_exceeds_max_alloc() {
+        // u64::MAX / 2 + 1 should be rejected by the guard
+        // On 64-bit, usize::MAX > u64::MAX / 2, so a single large value fails
+        assert_eq!(checked_pitched_size(&[usize::MAX]), None);
+    }
+
+    #[test]
+    fn test_pitched_at_max_alloc_boundary() {
+        // u64::MAX / 2 = 9223372036854775807, which equals isize::MAX on 64-bit
+        // This should be accepted (<=)
+        let half = (u64::MAX / 2) as usize;
+        assert_eq!(checked_pitched_size(&[half]), Some(half as u64));
     }
 }

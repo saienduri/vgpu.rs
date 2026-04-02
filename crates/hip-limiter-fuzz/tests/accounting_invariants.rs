@@ -548,3 +548,58 @@ proptest! {
         }
     }
 }
+
+// --- Effective memory limit proptests ---
+
+proptest! {
+    /// When effective_mem_limit is set (non-zero, below mem_limit),
+    /// pod_memory_used must never exceed the effective limit.
+    #[test]
+    fn effective_limit_gates_alloc(
+        mem_limit in 1000u64..100_000,
+        effective_ratio in 0.1f64..0.9,
+        sizes in proptest::collection::vec(1u64..500, 1..50),
+    ) {
+        let limiter = SimulatedLimiter::new(mem_limit);
+        let effective = (mem_limit as f64 * effective_ratio) as u64;
+        limiter.set_effective_mem_limit(effective);
+
+        let mut ptrs = Vec::new();
+        for size in sizes {
+            match limiter.try_alloc(size) {
+                Ok(ptr) => ptrs.push(ptr),
+                Err(()) => {}
+            }
+            // Invariant: pod_memory_used never exceeds effective limit
+            prop_assert!(limiter.pod_memory_used() <= effective,
+                "pod_memory_used {} exceeded effective limit {}",
+                limiter.pod_memory_used(), effective);
+        }
+        // Cleanup
+        for ptr in ptrs { limiter.free(ptr); }
+        prop_assert_eq!(limiter.pod_memory_used(), 0);
+    }
+
+    /// When effective_mem_limit is 0 (default / not yet computed),
+    /// the limiter falls back to mem_limit as the allocation ceiling.
+    #[test]
+    fn effective_limit_zero_falls_back_to_mem_limit(
+        mem_limit in 1000u64..100_000,
+        sizes in proptest::collection::vec(1u64..500, 1..50),
+    ) {
+        let limiter = SimulatedLimiter::new(mem_limit);
+        // effective_mem_limit is 0 by default — should use mem_limit
+        prop_assert_eq!(limiter.effective_mem_limit(), 0);
+
+        let mut ptrs = Vec::new();
+        for size in sizes {
+            match limiter.try_alloc(size) {
+                Ok(ptr) => ptrs.push(ptr),
+                Err(()) => {}
+            }
+            prop_assert!(limiter.pod_memory_used() <= mem_limit);
+        }
+        for ptr in ptrs { limiter.free(ptr); }
+        prop_assert_eq!(limiter.pod_memory_used(), 0);
+    }
+}

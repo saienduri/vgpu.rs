@@ -5,12 +5,12 @@ edition = "2021"
 publish = false
 
 [lib]
-path = "src/simulated_limiter.rs"
+path = "src/lib.rs"
 
 [dependencies]
 dashmap = { workspace = true }
+utils = { workspace = true }
 
 [dev-dependencies]
 proptest = "1.6"
-utils = { workspace = true }
 tempfile = { workspace = true }
