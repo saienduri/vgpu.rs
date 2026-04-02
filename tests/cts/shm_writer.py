@@ -9,22 +9,22 @@ Binary layout (V2):
   [0..4)     u32 LE discriminant = 1 (V2)
   [4..8)     4 bytes alignment padding
   [8..)      SharedDeviceStateV2 data:
-               devices:       16 * DeviceEntryV2 (16 * 136 = 2176 bytes)
+               devices:       16 * DeviceEntryV2 (16 * 144 = 2304 bytes)
                device_count:  u32 (4 bytes)
                _pad:          4 bytes alignment
                last_heartbeat: u64 (8 bytes)
                pids:          ShmMutex<Set<usize, 2048>> (32792 bytes, zeroed)
                _padding:      512 bytes
 
-Total file size: 35504 bytes
+Total file size: 35632 bytes
 
-DeviceEntryV2 (136 bytes):
+DeviceEntryV2 (144 bytes):
   uuid:        [u8; 64]  — null-terminated UTF-8 string
-  device_info: SharedDeviceInfoV2 (64 bytes)
+  device_info: SharedDeviceInfoV2 (72 bytes)
   is_active:   u32
   _pad:        4 bytes (implicit from repr(C) alignment)
 
-SharedDeviceInfoV2 (64 bytes):
+SharedDeviceInfoV2 (72 bytes):
   up_limit:               u32  (offset +0)
   _pad:                   4 bytes (alignment for u64)
   mem_limit:              u64  (offset +8)
@@ -35,6 +35,7 @@ SharedDeviceInfoV2 (64 bytes):
   erl_token_capacity:     u64  (offset +40)  — f64 stored as bits
   erl_current_tokens:     u64  (offset +48)  — f64 stored as bits
   erl_last_token_update:  u64  (offset +56)  — f64 stored as bits
+  effective_mem_limit:    u64  (offset +64)  — 0 = not yet computed (after ERL for Go compat)
 """
 
 import os
@@ -57,14 +58,14 @@ RUST_V2_DISCRIMINANT = 1
 # 4-byte discriminant + 4-byte alignment padding
 RUST_ENUM_HEADER_SIZE = 8
 
-# DeviceEntryV2 = UUID(64) + SharedDeviceInfoV2(64) + IsActive(4) + pad(4)
-RUST_DEVICE_ENTRY_V2_SIZE = 136
+# DeviceEntryV2 = UUID(64) + SharedDeviceInfoV2(72) + IsActive(4) + pad(4)
+RUST_DEVICE_ENTRY_V2_SIZE = 144
 
-# SharedDeviceInfoV2 size (all fields)
-RUST_DEVICE_INFO_V2_SIZE = 64
+# SharedDeviceInfoV2 size (all fields including effective_mem_limit)
+RUST_DEVICE_INFO_V2_SIZE = 72
 
 # Offset of pids field within SharedDeviceStateV2
-# = devices(16 * 136) + device_count(4) + pad(4) + last_heartbeat(8)
+# = devices(16 * 144) + device_count(4) + pad(4) + last_heartbeat(8)
 RUST_V2_PIDS_OFFSET = MAX_DEVICES * RUST_DEVICE_ENTRY_V2_SIZE + 4 + 4 + 8
 
 # ShmMutex<Set<usize, 2048>>:
@@ -82,8 +83,8 @@ RUST_SHARED_DEVICE_STATE_TOTAL_SIZE = (
     + RUST_STATE_PADDING_SIZE
 )
 
-assert RUST_SHARED_DEVICE_STATE_TOTAL_SIZE == 35504, (
-    f"Total size mismatch: {RUST_SHARED_DEVICE_STATE_TOTAL_SIZE} != 35504"
+assert RUST_SHARED_DEVICE_STATE_TOTAL_SIZE == 35632, (
+    f"Total size mismatch: {RUST_SHARED_DEVICE_STATE_TOTAL_SIZE} != 35632"
 )
 
 # ── Offsets within the file ──
@@ -125,7 +126,7 @@ def _pack_uuid(uuid_str: str) -> bytes:
 
 
 def _pack_device_info_v2(spec: DeviceSpec) -> bytes:
-    """Pack SharedDeviceInfoV2 into 64 bytes.
+    """Pack SharedDeviceInfoV2 into 72 bytes.
 
     Layout (all little-endian):
       u32 up_limit
@@ -138,9 +139,10 @@ def _pack_device_info_v2(spec: DeviceSpec) -> bytes:
       u64 erl_token_capacity     (f64 bits)
       u64 erl_current_tokens     (f64 bits)
       u64 erl_last_token_update  (f64 bits)
+      u64 effective_mem_limit    (0 = not yet computed, after ERL for Go compat)
     """
     return struct.pack(
-        "<I I Q I I Q Q Q Q Q",
+        "<I I Q I I Q Q Q Q Q Q",
         spec.up_limit,
         0,  # padding
         spec.mem_limit,
@@ -151,15 +153,16 @@ def _pack_device_info_v2(spec: DeviceSpec) -> bytes:
         struct.unpack("<Q", struct.pack("<d", spec.erl_token_capacity))[0],
         struct.unpack("<Q", struct.pack("<d", spec.erl_current_tokens))[0],
         struct.unpack("<Q", struct.pack("<d", spec.erl_last_token_update))[0],
+        0,  # effective_mem_limit (0 = not yet computed, limiter updates at runtime)
     )
 
 
 def _pack_device_entry_v2(spec: DeviceSpec) -> bytes:
-    """Pack a DeviceEntryV2 into 136 bytes.
+    """Pack a DeviceEntryV2 into 144 bytes.
 
     Layout:
       [u8; 64]           uuid
-      SharedDeviceInfoV2  device_info (64 bytes)
+      SharedDeviceInfoV2  device_info (72 bytes)
       u32                is_active
       [u8; 4]            padding (repr(C) alignment)
     """
@@ -182,7 +185,7 @@ def create_shm_file(path: str, devices: List[DeviceSpec]) -> None:
         path: File path to write (this becomes the 'shm' file the crate mmaps).
         devices: List of device specifications. Max 16 devices.
 
-    The file is created with size RUST_SHARED_DEVICE_STATE_TOTAL_SIZE (35504 bytes).
+    The file is created with size RUST_SHARED_DEVICE_STATE_TOTAL_SIZE (35632 bytes).
     All regions not explicitly written (pids, padding) are zero-filled, which is
     the correct initial state (lock=0 means unlocked).
     """

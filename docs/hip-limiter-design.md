@@ -80,6 +80,26 @@ This ensures that SIGKILL'd processes' phantom usage is recovered by the next pr
 
 **SHM cleanup:** `set_owner(false)` means the segment persists after process exit. The default path (`/dev/shm/tensor-fusion`) is on tmpfs, cleaned up on reboot. In containers, tmpfs is cleaned up on pod termination.
 
+### DRM-Aware Overhead Tracking (effective_mem_limit)
+
+Not all GPU VRAM usage goes through `hipMalloc`. The kernel allocates memory for code objects, scratch buffers, page tables, and HSA state that is invisible to the limiter's allocation hooks. On MI325X with PyTorch workloads, this non-hipMalloc overhead ranges from 3.5–9 GiB — enough to cause overcommit in multi-process pods if the limiter only tracks hooked allocations.
+
+**How it works:**
+
+1. **DRM fdinfo measurement** — `read_drm_resident_vram_all()` reads `/proc/self/fdinfo` to get the kernel's view of per-BDF resident VRAM for the current process. Returns a `HashMap<String, u64>` (BDF → bytes) from a single directory scan.
+
+2. **Overhead calculation** — For each mapped device: `non_hip_bytes = drm_resident - tracked_hipMalloc`. The difference is the kernel-side overhead invisible to hooks.
+
+3. **Per-process proc_slots** — Each process writes its per-device non-hip overhead into a `ProcSlotHandle` (a slot in the proc_slots SHM segment containing `[AtomicU64; MAX_DEVICES]`). This allows summing overhead across all processes sharing the pod.
+
+4. **Effective limit** — `recalculate_effective_limit()` sums non-hip overhead across all live processes and computes `effective_mem_limit = mem_limit - total_overhead`. The `try_reserve` fast path uses `effective_mem_limit` when non-zero, falling back to `mem_limit` before the first reconciliation.
+
+**All-devices reconciliation:** Every 100th `hipMalloc` (controlled by `alloc_count`), `log_reconciliation()` performs a single fdinfo scan and a single DashMap pass, then updates overhead and effective limits for ALL mapped devices — not just the device being allocated on. This prevents stale effective limits on multi-GPU pods where allocations concentrate on one device.
+
+**Reap integration:** When `reap_dead_pids()` removes a dead process's slot, it recalculates effective limits for all mapped devices (not just ones with hipMalloc usage, since dead processes may have had non-hip overhead on any device).
+
+**Overhead warning:** If total overhead exceeds 25% of `mem_limit` for any device, a WARN-level log is emitted. This threshold is informational — the effective limit still tightens regardless.
+
 **Size parser** (`size_parser.rs`): Parses human-readable memory limits — plain bytes (`137438953472`), SI suffixes (`126G`, `126GB`, `512M`), binary suffixes (`126GiB`, `512MiB`). Case-insensitive. Returns `None` for zero, negative, overflow, or unparseable input.
 
 ### Production Mode
@@ -139,6 +159,8 @@ The `Limiter` struct:
 | `allocation_tracker` | `DashMap<usize, (usize, u64)>` | pointer → (device_idx, size) |
 | `isolation` | `Option<String>` | Must be `"soft"` or `None` for enforcement |
 | `standalone` | `bool` | Suppresses heartbeat warnings when `true` |
+| `alloc_count` | `AtomicU64` | Per-process allocation counter — triggers reconciliation every 100 allocs |
+| `proc_slots` | `Option<ProcSlotHandle>` | Per-process slot in the proc_slots SHM segment for non-hipMalloc overhead tracking |
 
 Key methods:
 - `try_reserve(device_idx, size)` — atomic `fetch_add` on SHM, rollback if over limit
@@ -149,6 +171,9 @@ Key methods:
 - `drain_allocations()` — atexit handler: iterates `allocation_tracker`, aggregates per-device totals, bulk `saturating_fetch_sub` per device. Uses `eprintln` (not tracing) because TLS may be destroyed at exit time. Wrapped in `catch_unwind` at the call site.
 - `device_index_by_hip_device(hip_device)` — resolves HIP ordinal to SHM device index via PCI BDF
 - `device_index_by_pci_bdf(bdf)` — resolves PCI BDF to device index (used by amdsmi hooks)
+- `log_reconciliation(device_idx)` — every 100th alloc: single fdinfo scan + single DashMap pass, updates overhead and effective limit for ALL mapped devices
+- `update_effective_limit(device_idx, non_hip_bytes, mem_limit)` — writes per-process non-hip overhead to proc_slots, recalculates effective limit
+- `recalculate_effective_limit(ps, state, device_idx)` — sums non-hip overhead across all processes, sets `effective_mem_limit = mem_limit - total_overhead`
 
 ### `size_parser.rs` — Memory Limit Parser
 
@@ -192,20 +217,24 @@ Thin `libloading` wrapper around `libamdhip64.so` for non-hooked HIP queries (`h
 Binary layout shared between the Go hypervisor (writer) and Rust limiter (reader/writer):
 
 ```
-SharedDeviceStateV2:
-  devices: [DeviceEntryV2; 16]       — per-device state (max 16 devices)
+SharedDeviceStateV2 (35632 bytes total):
+  devices: [DeviceEntryV2; 16]       — per-device state (16 × 144 = 2304 bytes)
     uuid: [u8; 64]                   — GPU UUID string
+    device_info: SharedDeviceInfoV2 (72 bytes)
+      up_limit: AtomicU32           — utilization percentage
+      mem_limit: AtomicU64          — VRAM limit in bytes (Go writes, or standalone self-writes)
+      total_cuda_cores: AtomicU32   — compute cores
+      pod_memory_used: AtomicU64    — current usage (Rust reads/writes)
+      erl_*: 4 × AtomicU64         — ERL token bucket fields (future compute enforcement)
+      effective_mem_limit: AtomicU64 — mem_limit minus non-hipMalloc overhead (0 = not yet computed)
     is_active: AtomicU32             — device active flag
-    device_info: SharedDeviceInfoV2
-      mem_limit: AtomicU64           — VRAM limit in bytes (Go writes, or standalone self-writes)
-      pod_memory_used: AtomicU64     — current usage (Rust reads/writes)
-      up_limit: AtomicU32            — utilization percentage
-      total_cuda_cores: AtomicU32    — compute cores
-      erl_*: ...                     — ERL token bucket fields (future compute enforcement)
   device_count: AtomicU32
   last_heartbeat: AtomicU64          — staleness detection (2s threshold, suppressed in standalone)
-  pids: ShmMutex<Set<usize, 2048>>   — tracked process IDs
+  pids: ShmMutex<Set<usize, 2048>>   — tracked process IDs (32792 bytes)
+  padding: [u8; 512]
 ```
+
+`effective_mem_limit` is placed after the ERL fields (offset +64 within SharedDeviceInfoV2) for Go ABI compatibility.
 
 **Production:** Go writes `mem_limit`, `up_limit`, `last_heartbeat`, device UUIDs. Rust writes `pod_memory_used`.
 **Standalone:** Rust writes everything at init via `SharedDeviceState::new()`, then writes `pod_memory_used` at runtime.
@@ -322,7 +351,7 @@ For DinD, add to Docker run flags:
 | **`libamdhip64.so` not loaded** | Hooks are deferred until a `dlsym` call resolves a HIP symbol. If the library is never loaded (non-GPU workload), the limiter is a silent no-op. |
 | **Hook installation panic** | Caught by `catch_unwind`. Hooks are not installed, error is logged. Application continues without enforcement. |
 | **Crash between free and decrement** | Over-reports memory usage (safe direction). Requires pod restart or SHM recreation to reset. |
-| **`pod_memory_used` drift** | No manual reset mechanism. Hypervisor must recreate SHM or pod must be deleted. In standalone mode, restarting all preloaded processes re-creates SHM with zeroed counters. |
+| **`pod_memory_used` drift** | DRM-aware reconciliation dynamically tightens `effective_mem_limit` to account for non-hipMalloc overhead, preventing overcommit from kernel-side VRAM usage. For hipMalloc-level drift: no manual reset mechanism — hypervisor must recreate SHM or pod must be deleted. In standalone mode, restarting all preloaded processes re-creates SHM with zeroed counters. |
 | **Invalid `TF_MEMORY_LIMIT`** | Limiter is not initialized, all hooks become passthrough. Logged as warning. |
 | **`TF_MEMORY_LIMIT` with no visible GPUs** | Limiter is not initialized, logged as error: "TF_MEMORY_LIMIT set but no GPUs visible". |
 | **SHM directory not writable** | `SharedMemoryHandle::create` fails on `create_dir_all` or `shmem.create()`. Limiter is not initialized, passthrough. |

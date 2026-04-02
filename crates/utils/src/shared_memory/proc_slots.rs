@@ -19,7 +19,20 @@ const PROC_SLOTS_SHM_ID: &str = "proc_slots";
 pub struct ProcSlot {
     pub pid: AtomicU32, // 0 = empty slot
     _pad: u32,
-    pub used: [AtomicU64; MAX_DEVICES], // per-device memory usage
+    pub used: [AtomicU64; MAX_DEVICES], // per-device hipMalloc memory usage
+    pub non_hip: [AtomicU64; MAX_DEVICES], // per-device non-hipMalloc overhead (from DRM fdinfo)
+}
+
+impl ProcSlot {
+    /// Zero all per-device counters (used + non_hip).
+    fn zero_counters(&self) {
+        for counter in &self.used {
+            counter.store(0, Ordering::Release);
+        }
+        for counter in &self.non_hip {
+            counter.store(0, Ordering::Release);
+        }
+    }
 }
 
 #[repr(C)]
@@ -51,9 +64,7 @@ impl ProcSlotTable {
                 .is_ok()
             {
                 // Zero the usage counters (previous occupant may have left data).
-                for counter in &slot.used {
-                    counter.store(0, Ordering::Release);
-                }
+                slot.zero_counters();
                 return Some(i);
             }
         }
@@ -141,6 +152,29 @@ impl ProcSlotTable {
         out
     }
 
+    /// Write the non-hipMalloc overhead (in bytes) for a device in a slot.
+    /// Called during reconciliation after reading DRM fdinfo.
+    pub fn write_non_hip(&self, slot_idx: usize, device_idx: usize, bytes: u64) {
+        if slot_idx < MAX_PROC_SLOTS && device_idx < MAX_DEVICES {
+            self.slots[slot_idx].non_hip[device_idx].store(bytes, Ordering::Release);
+        }
+    }
+
+    /// Sum non-hipMalloc overhead across all active (non-empty) slots for a device.
+    /// Returns total bytes of non-hipMalloc VRAM overhead on this device.
+    pub fn sum_non_hip_for_device(&self, device_idx: usize) -> u64 {
+        if device_idx >= MAX_DEVICES {
+            return 0;
+        }
+        let mut total: u64 = 0;
+        for slot in &self.slots {
+            if slot.pid.load(Ordering::Acquire) != 0 {
+                total = total.saturating_add(slot.non_hip[device_idx].load(Ordering::Relaxed));
+            }
+        }
+        total
+    }
+
     /// Zero all per-device usage counters for a slot, then release it.
     ///
     /// The ordering matters: counters must be zeroed BEFORE the PID is set to 0,
@@ -149,9 +183,7 @@ impl ProcSlotTable {
     /// the PID is 0 but counters still hold old values).
     pub fn zero_and_release(&self, slot_idx: usize) {
         if slot_idx < MAX_PROC_SLOTS {
-            for counter in &self.slots[slot_idx].used {
-                counter.store(0, Ordering::Release);
-            }
+            self.slots[slot_idx].zero_counters();
             self.release_slot(slot_idx);
         }
     }
@@ -187,9 +219,7 @@ impl ProcSlotTable {
         }
         // CAS succeeded — we own this slot. Zero counters before any new claimer
         // can observe them (defense-in-depth; claim_slot also zeroes).
-        for counter in &self.slots[slot_idx].used {
-            counter.store(0, Ordering::Release);
-        }
+        self.slots[slot_idx].zero_counters();
         Some(usage)
     }
 
@@ -309,6 +339,19 @@ impl ProcSlotHandle {
         if idx != NO_SLOT {
             self.table().sub_usage(idx, device_idx, size);
         }
+    }
+
+    /// Write non-hipMalloc overhead for a device (from DRM fdinfo reconciliation).
+    pub fn write_non_hip(&self, device_idx: usize, bytes: u64) {
+        let idx = self.slot_idx.load(Ordering::Acquire);
+        if idx != NO_SLOT {
+            self.table().write_non_hip(idx, device_idx, bytes);
+        }
+    }
+
+    /// Sum non-hipMalloc overhead across all active processes for a device.
+    pub fn sum_non_hip_for_device(&self, device_idx: usize) -> u64 {
+        self.table().sum_non_hip_for_device(device_idx)
     }
 
     /// Scan for dead processes, atomically claim their slots, and return usage.
@@ -698,5 +741,126 @@ mod tests {
         // Second reap finds nothing
         let reaped2 = handle.reap_dead();
         assert!(reaped2.is_empty());
+    }
+
+    // -- non_hip overhead tracking tests --
+
+    #[test]
+    fn write_and_read_non_hip() {
+        let table = ProcSlotTable::new_zeroed();
+        table.initialize();
+        let idx = table.claim_slot(1).unwrap();
+
+        table.write_non_hip(idx, 0, 2048 * 1024 * 1024); // 2 GiB
+        table.write_non_hip(idx, 1, 512 * 1024 * 1024); // 512 MiB
+
+        assert_eq!(
+            table.slots[idx].non_hip[0].load(Ordering::Relaxed),
+            2048 * 1024 * 1024
+        );
+        assert_eq!(
+            table.slots[idx].non_hip[1].load(Ordering::Relaxed),
+            512 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn write_non_hip_overwrites_previous() {
+        let table = ProcSlotTable::new_zeroed();
+        table.initialize();
+        let idx = table.claim_slot(1).unwrap();
+
+        table.write_non_hip(idx, 0, 1000);
+        table.write_non_hip(idx, 0, 2000);
+        assert_eq!(table.slots[idx].non_hip[0].load(Ordering::Relaxed), 2000);
+    }
+
+    #[test]
+    fn sum_non_hip_across_slots() {
+        let table = ProcSlotTable::new_zeroed();
+        table.initialize();
+
+        let idx1 = table.claim_slot(1).unwrap();
+        let idx2 = table.claim_slot(2).unwrap();
+        let idx3 = table.claim_slot(3).unwrap();
+
+        table.write_non_hip(idx1, 0, 3000);
+        table.write_non_hip(idx2, 0, 5000);
+        table.write_non_hip(idx3, 0, 2000);
+
+        // Device 0: 3000 + 5000 + 2000 = 10000
+        assert_eq!(table.sum_non_hip_for_device(0), 10000);
+
+        // Device 1: no writes, should be 0
+        assert_eq!(table.sum_non_hip_for_device(1), 0);
+    }
+
+    #[test]
+    fn sum_non_hip_excludes_released_slots() {
+        let table = ProcSlotTable::new_zeroed();
+        table.initialize();
+
+        let idx1 = table.claim_slot(1).unwrap();
+        let idx2 = table.claim_slot(2).unwrap();
+
+        table.write_non_hip(idx1, 0, 3000);
+        table.write_non_hip(idx2, 0, 5000);
+
+        assert_eq!(table.sum_non_hip_for_device(0), 8000);
+
+        // Release slot 1 — its overhead should no longer be counted
+        table.zero_and_release(idx1);
+        assert_eq!(table.sum_non_hip_for_device(0), 5000);
+    }
+
+    #[test]
+    fn claim_slot_zeroes_non_hip() {
+        let table = ProcSlotTable::new_zeroed();
+        table.initialize();
+
+        let idx = table.claim_slot(1).unwrap();
+        table.write_non_hip(idx, 0, 9999);
+        table.release_slot(idx);
+
+        // New occupant should see zeroed non_hip
+        let idx2 = table.claim_slot(2).unwrap();
+        assert_eq!(idx, idx2, "should reuse same slot");
+        assert_eq!(table.slots[idx2].non_hip[0].load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn write_non_hip_out_of_bounds_is_noop() {
+        let table = ProcSlotTable::new_zeroed();
+        table.initialize();
+        let idx = table.claim_slot(1).unwrap();
+
+        // Out-of-bounds device_idx — should not panic
+        table.write_non_hip(idx, MAX_DEVICES, 1000);
+        table.write_non_hip(idx, usize::MAX, 1000);
+
+        // Out-of-bounds slot_idx — should not panic
+        table.write_non_hip(MAX_PROC_SLOTS, 0, 1000);
+    }
+
+    #[test]
+    fn sum_non_hip_out_of_bounds_returns_zero() {
+        let table = ProcSlotTable::new_zeroed();
+        table.initialize();
+
+        assert_eq!(table.sum_non_hip_for_device(MAX_DEVICES), 0);
+        assert_eq!(table.sum_non_hip_for_device(usize::MAX), 0);
+    }
+
+    #[test]
+    fn handle_write_and_sum_non_hip() {
+        let tmp = TempDir::new().unwrap();
+        let handle = ProcSlotHandle::create_and_claim(tmp.path()).unwrap();
+
+        handle.write_non_hip(0, 4096);
+        assert_eq!(handle.sum_non_hip_for_device(0), 4096);
+
+        // After drain, our contribution should be gone
+        let _ = handle.drain_our_slot();
+        assert_eq!(handle.sum_non_hip_for_device(0), 0);
     }
 }

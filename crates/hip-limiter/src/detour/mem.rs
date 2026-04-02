@@ -1131,14 +1131,24 @@ pub(crate) unsafe fn enable_hooks(hook_manager: &mut HookManager) -> Result<(), 
     // different address: hipGetDeviceProperties (default @@hip_4.2),
     // hipGetDevicePropertiesR0000 (@@hip_4.2), hipGetDevicePropertiesR0600 (@@hip_6.0).
     // PyTorch compiles against the R0600 variant. All three share the same ABI.
-    replace_symbol!(
+    //
+    // The bare symbol is a tiny trampoline (single jmp into R0000) that Frida cannot
+    // safely patch — it returns "Bad signature". This is non-fatal: no modern HIP code
+    // calls the bare symbol (hip_runtime_api.h #defines it to R0600). The R0600/R0000
+    // hooks below cover all real callers.
+    if let Err(e) = replace_symbol!(
         hook_manager,
         Some("libamdhip64."),
         "hipGetDeviceProperties",
         hip_get_device_properties_detour,
         FnHip_get_device_properties,
         FN_HIP_GET_DEVICE_PROPERTIES
-    )?;
+    ) {
+        tracing::warn!(
+            "hipGetDeviceProperties bare symbol hook failed: {e:#} — \
+             R0600/R0000 hooks will cover all callers"
+        );
+    }
     replace_symbol!(
         hook_manager,
         Some("libamdhip64."),

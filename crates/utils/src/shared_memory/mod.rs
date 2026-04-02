@@ -174,6 +174,12 @@ pub struct SharedDeviceInfoV2 {
     pub erl_current_tokens: AtomicU64,
     /// Last token update timestamp (microseconds)
     pub erl_last_token_update: AtomicU64,
+
+    /// Effective memory limit after subtracting non-hipMalloc overhead from all processes.
+    /// 0 means not yet computed — enforcement falls back to mem_limit.
+    /// Updated during reconciliation: effective = mem_limit - sum(non_hip across all proc slots).
+    /// Placed AFTER ERL fields to preserve field offsets for Go hypervisor compatibility.
+    pub effective_mem_limit: AtomicU64,
 }
 
 // Type alias for backward compatibility
@@ -250,6 +256,7 @@ impl SharedDeviceInfoV2 {
             erl_token_capacity: AtomicU64::new(100.0_f64.to_bits()),
             erl_current_tokens: AtomicU64::new(100.0_f64.to_bits()),
             erl_last_token_update: AtomicU64::new(0.0_f64.to_bits()),
+            effective_mem_limit: AtomicU64::new(0), // 0 = not yet computed, use mem_limit
         }
     }
 
@@ -283,6 +290,18 @@ impl SharedDeviceInfoV2 {
 
     pub fn set_pod_memory_used(&self, memory: u64) {
         self.pod_memory_used.store(memory, Ordering::Release);
+    }
+
+    /// Get the effective memory limit (mem_limit minus total non-hipMalloc overhead).
+    /// Returns 0 if not yet computed (caller should fall back to mem_limit).
+    pub fn get_effective_mem_limit(&self) -> u64 {
+        self.effective_mem_limit.load(Ordering::Acquire)
+    }
+
+    /// Set the effective memory limit. Called during reconciliation after computing
+    /// total non-hipMalloc overhead across all proc slots.
+    pub fn set_effective_mem_limit(&self, limit: u64) {
+        self.effective_mem_limit.store(limit, Ordering::Release);
     }
 
     /// Atomically subtract `size` from pod_memory_used, clamping at 0 to prevent

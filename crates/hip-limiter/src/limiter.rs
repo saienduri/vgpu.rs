@@ -55,6 +55,8 @@ pub(crate) struct Limiter {
     alloc_count: AtomicU64,
     /// Per-PID usage tracking in SHM (standalone mode only).
     proc_slots: Option<ProcSlotHandle>,
+    /// Process command line for diagnostics (from /proc/self/cmdline at init).
+    process_cmdline: String,
 }
 
 impl std::fmt::Debug for Limiter {
@@ -104,6 +106,70 @@ pub(crate) fn resolve_device_indices(
 /// (HIP device ordinal, PCI Bus/Device/Function address)
 pub(crate) type EnumeratedDevice = (i32, String);
 
+/// Read `/proc/self/cmdline` and return a human-readable command string.
+/// Returns a truncated string (max 200 chars) to avoid bloating log lines.
+fn read_process_cmdline() -> String {
+    let raw = match std::fs::read("/proc/self/cmdline") {
+        Ok(bytes) => bytes,
+        Err(_) => return String::from("<unknown>"),
+    };
+    let cmdline: String = raw
+        .split(|&b| b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if cmdline.is_empty() {
+        return String::from("<unknown>");
+    }
+    if cmdline.len() > 200 {
+        format!("{}…", &cmdline[..200])
+    } else {
+        cmdline
+    }
+}
+
+/// Read DRM fdinfo from `/proc/self/fdinfo/*` in a single pass and return
+/// `drm-resident-vram` in bytes, keyed by PCI BDF (from `drm-pdev:` line).
+///
+/// Each open fd to a DRM render node includes a `drm-pdev:` line identifying which GPU
+/// it belongs to. We bucket VRAM by BDF so callers can look up per-device usage without
+/// re-scanning fdinfo for each GPU.
+///
+/// Fds without a `drm-pdev:` line are skipped (non-DRM fds).
+fn read_drm_resident_vram_all() -> std::collections::HashMap<String, u64> {
+    let mut by_bdf: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let entries = match std::fs::read_dir("/proc/self/fdinfo") {
+        Ok(entries) => entries,
+        Err(_) => return by_bdf,
+    };
+    for entry in entries.flatten() {
+        let content = match std::fs::read_to_string(entry.path()) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        // Extract BDF from drm-pdev line
+        let mut bdf = None;
+        let mut vram_bytes: u64 = 0;
+        for line in content.lines() {
+            if let Some(rest) = line.strip_prefix("drm-pdev:") {
+                bdf = Some(rest.trim().to_string());
+            } else if let Some(rest) = line.strip_prefix("drm-resident-vram:") {
+                let rest = rest.trim();
+                if let Some(kib_str) = rest.strip_suffix(" KiB") {
+                    if let Ok(kib) = kib_str.trim().parse::<u64>() {
+                        vram_bytes += kib * 1024;
+                    }
+                }
+            }
+        }
+        if let Some(bdf) = bdf {
+            *by_bdf.entry(bdf).or_insert(0) += vram_bytes;
+        }
+    }
+    by_bdf
+}
+
 impl Limiter {
     /// `pre_enumerated`: devices from sysfs; when `Some`, skips HIP runtime calls (fork-safe).
     pub(crate) fn new(
@@ -132,7 +198,10 @@ impl Limiter {
 
         let gpu_idx_uuids = resolve_device_indices(&gpu_uuids, &enumerated_devices);
 
+        let process_cmdline = read_process_cmdline();
+
         tracing::info!(
+            cmdline = process_cmdline,
             "Limiter initialized with GPU UUIDs and indices: {:?}",
             gpu_idx_uuids
         );
@@ -147,6 +216,7 @@ impl Limiter {
             standalone,
             alloc_count: AtomicU64::new(0),
             proc_slots,
+            process_cmdline,
         })
     }
 
@@ -316,24 +386,30 @@ impl Limiter {
         device_idx: usize,
         size: u64,
     ) -> Result<u64, Error> {
-        // Both fetch_add and get_mem_limit are read in a single with_device call
-        // to avoid a race where the device becomes unavailable between calls.
-        let reserve_result: Option<(u64, u64)> = state.with_device_v2_or(
+        // Read all three values atomically within a single with_device call:
+        // - fetch_add the reservation
+        // - get mem_limit (raw limit from hypervisor)
+        // - get effective_mem_limit (limit minus non-hipMalloc overhead)
+        let reserve_result: Option<(u64, u64, u64)> = state.with_device_v2_or(
             device_idx,
             |device| {
                 let previous_used = device.device_info.pod_memory_used.fetch_add(size, Ordering::AcqRel);
                 let mem_limit = device.device_info.get_mem_limit();
-                (previous_used, mem_limit)
+                let effective = device.device_info.get_effective_mem_limit();
+                (previous_used, mem_limit, effective)
             },
         );
 
-        let Some((previous_used, mem_limit)) = reserve_result else {
+        let Some((previous_used, mem_limit, effective)) = reserve_result else {
             return Err(Error::DeviceNotConfigured(format!("SHM device {device_idx}")));
         };
 
+        // Use effective_mem_limit if it has been computed (non-zero), otherwise
+        // fall back to raw mem_limit (first 100 allocs before first reconciliation).
+        let active_limit = if effective > 0 { effective } else { mem_limit };
         let new_used = previous_used.saturating_add(size);
 
-        if new_used > mem_limit {
+        if new_used > active_limit {
             // Over limit — roll back the reservation
             state.with_device_v2_or(
                 device_idx,
@@ -342,7 +418,7 @@ impl Limiter {
             return Err(Error::OverLimit {
                 used: previous_used,
                 request: size,
-                limit: mem_limit,
+                limit: active_limit,
                 device_idx,
             });
         }
@@ -393,66 +469,97 @@ impl Limiter {
         // Periodic reconciliation: compare our counter with real VRAM usage
         let count = self.alloc_count.fetch_add(1, Ordering::Relaxed);
         if count % 100 == 0 {
+            // Reap dead processes during reconciliation to keep effective_mem_limit
+            // tracking reality. Without this, stale proc slots from dead processes
+            // accumulate non_hip overhead that no longer exists on the GPU, causing
+            // the effective limit to be artificially conservative.
+            self.reap_dead_pids();
             self.log_reconciliation(device_idx, count);
         }
     }
 
-    /// Compare pod_memory_used (our counter) with real VRAM from the original hipMemGetInfo.
-    /// Logs when they diverge, helping diagnose accounting drift.
+    /// Reconciliation: compare our hipMalloc tracker with DRM fdinfo (real per-process VRAM),
+    /// compute non-hipMalloc overhead, and update the effective memory limit.
     ///
-    /// Emits three key metrics:
-    /// - `shm_vs_real_mib`: SHM counter minus real VRAM (positive = SHM over-reports)
-    /// - `tracker_vs_shm_mib`: DashMap sum minus SHM (negative = stale residual from other processes)
-    /// - `stale_mib`: at alloc_count=0, shows how much SHM was already non-zero before this process
+    /// Reads `/proc/self/fdinfo` once and updates overhead + effective_mem_limit for ALL
+    /// mapped devices, not just the triggering device. This ensures multi-GPU pods keep
+    /// all devices' effective limits fresh even if allocations concentrate on one device.
+    ///
+    /// Key metrics (logged for the triggering device):
+    /// - `tracked_bytes/tracked_count`: our hipMalloc accounting (per-process, authoritative)
+    /// - `drm_resident_mib`: real per-process VRAM from kernel DRM fdinfo (all sources)
+    /// - `non_hip_mib`: per-process overhead not from hipMalloc (compiled kernels, scratch, context)
+    /// - `total_overhead_mib`: sum of non_hip across ALL concurrent processes on this device
+    /// - `effective_limit_mib`: mem_limit minus total_overhead (what hipMalloc enforcement uses)
+    /// - `tracker_vs_slot_mib`: DashMap sum minus proc slot usage (should be 0; non-zero = accounting bug)
+    /// - `stale_mib`: at alloc_count=0, how much SHM was non-zero before this process started
+    /// - `cmdline`: process command line (logged at first alloc only)
     fn log_reconciliation(&self, device_idx: usize, alloc_count: u64) {
-        use crate::detour::mem::FN_HIP_MEM_GET_INFO;
-
         let pid = std::process::id();
 
-        // Guard: hook may not be initialized yet during early startup
-        let Some(hip_mem_get_info) = FN_HIP_MEM_GET_INFO.get() else {
-            return;
-        };
+        // Single fdinfo scan — returns per-BDF VRAM usage for all GPUs this process has open.
+        let drm_by_bdf = read_drm_resident_vram_all();
 
-        let (our_used, mem_limit) = self
+        // Single DashMap pass — compute per-device tracked bytes for all devices.
+        let tracked_count = self.allocation_tracker.len();
+        let mut tracked_by_device = std::collections::HashMap::<usize, u64>::new();
+        for entry in self.allocation_tracker.iter() {
+            *tracked_by_device.entry(entry.value().0).or_insert(0) += entry.value().1;
+        }
+
+        // Update overhead + effective_mem_limit for ALL mapped devices (not just the trigger).
+        // This keeps multi-GPU pods fresh even if allocs concentrate on one device.
+        let mut trigger_drm_resident = 0u64;
+        let mut trigger_overhead_mib = 0u64;
+        let mut trigger_effective_mib = 0u64;
+        for &(idx, ref uuid) in &self.gpu_idx_uuids {
+            let bdf = normalize_uuid_to_bdf(uuid);
+            let drm_resident = drm_by_bdf.get(&bdf).copied().unwrap_or(0);
+            let tracked = tracked_by_device.get(&idx).copied().unwrap_or(0);
+            let non_hip_bytes = drm_resident.saturating_sub(tracked);
+            let mem_limit = self.get_pod_memory_usage(idx).map(|(_, ml)| ml).unwrap_or(0);
+            let (overhead_mib, effective_mib) = self.update_effective_limit(idx, non_hip_bytes, mem_limit);
+            if idx == device_idx {
+                trigger_drm_resident = drm_resident;
+                trigger_overhead_mib = overhead_mib;
+                trigger_effective_mib = effective_mib;
+            }
+        }
+
+        // --- Detailed logging for the triggering device only ---
+
+        let (pod_used, mem_limit) = self
             .get_pod_memory_usage(device_idx)
-            .map(|(used, limit)| (used, limit))
             .unwrap_or((0, 0));
 
-        let mut real_free: usize = 0;
-        let mut real_total: usize = 0;
-        let result = unsafe { hip_mem_get_info(&mut real_free, &mut real_total) };
-        if result != 0 {
-            return; // native call failed, skip
-        }
-        let real_used = real_total.saturating_sub(real_free) as u64;
-        let tracked_count = self.allocation_tracker.len();
-        // Sum of all sizes in our process-local DashMap for this device
-        let tracked_bytes: u64 = self
-            .allocation_tracker
-            .iter()
-            .filter(|entry| entry.value().0 == device_idx)
-            .map(|entry| entry.value().1)
-            .sum();
+        let tracked_bytes = tracked_by_device.get(&device_idx).copied().unwrap_or(0);
+        let drm_resident_mib = trigger_drm_resident / (1024 * 1024);
+        let non_hip_mib = trigger_drm_resident.saturating_sub(tracked_bytes) / (1024 * 1024);
 
-        let shm_vs_real = our_used as i128 - real_used as i128;
-        let shm_vs_real_mib = shm_vs_real / (1024 * 1024);
-        let tracker_vs_shm = tracked_bytes as i128 - our_used as i128;
-        let tracker_vs_shm_mib = tracker_vs_shm / (1024 * 1024);
+        let total_overhead_mib = trigger_overhead_mib;
+        let effective_limit_mib = trigger_effective_mib;
 
-        // First alloc: detect stale SHM from prior processes that didn't drain
+        // Detect accounting bugs: compare our DashMap total with our proc slot usage.
+        let proc_slot_used = self.proc_slots.as_ref()
+            .and_then(|ps| ps.slot_idx().map(|idx| ps.table().read_slot_usage(idx)[device_idx]))
+            .unwrap_or(tracked_bytes);
+        let tracker_vs_slot_mib = (tracked_bytes as i128 - proc_slot_used as i128) / (1024 * 1024);
+
+        // First alloc: log initial state and detect stale SHM.
         if alloc_count == 0 {
-            let stale = our_used.saturating_sub(tracked_bytes);
+            let stale = pod_used.saturating_sub(tracked_bytes);
             let stale_mib = stale / (1024 * 1024);
             if stale_mib > 0 {
                 tracing::warn!(
                     pid,
                     device_idx,
-                    our_shm = our_used,
-                    real_vram = real_used,
+                    drm_resident_mib,
                     tracked_bytes,
                     mem_limit,
+                    effective_limit_mib,
+                    total_overhead_mib,
                     stale_mib,
+                    cmdline = self.process_cmdline,
                     "STALE SHM: counter is {stale_mib} MiB above this process's tracked total \
                      on first alloc — prior process(es) likely exited without drain"
                 );
@@ -460,44 +567,127 @@ impl Limiter {
                 tracing::info!(
                     pid,
                     device_idx,
-                    our_shm = our_used,
-                    real_vram = real_used,
+                    drm_resident_mib,
                     tracked_bytes,
                     mem_limit,
+                    effective_limit_mib,
+                    total_overhead_mib,
+                    cmdline = self.process_cmdline,
                     "initial SHM state on first alloc"
                 );
             }
             return;
         }
 
-        if shm_vs_real_mib.abs() > 100 || tracker_vs_shm_mib.abs() > 100 {
+        // WARN on accounting bug or dangerously high overhead.
+        let mem_limit_mib = mem_limit / (1024 * 1024);
+        let overhead_pct = if mem_limit_mib > 0 {
+            (total_overhead_mib * 100) / mem_limit_mib
+        } else {
+            0
+        };
+
+        if tracker_vs_slot_mib.abs() > 10 {
             tracing::warn!(
                 pid,
                 alloc_count,
                 device_idx,
-                our_shm = our_used,
-                real_vram = real_used,
+                drm_resident_mib,
+                non_hip_mib,
                 tracked_bytes,
                 tracked_count,
-                shm_vs_real_mib,
-                tracker_vs_shm_mib,
-                "RECONCILIATION DRIFT: SHM vs real VRAM = {shm_vs_real_mib} MiB, \
-                 tracker vs SHM = {tracker_vs_shm_mib} MiB"
+                tracker_vs_slot_mib,
+                effective_limit_mib,
+                total_overhead_mib,
+                mem_limit,
+                "ACCOUNTING DRIFT: tracker vs proc_slot = {tracker_vs_slot_mib} MiB \
+                 (expected ~0, non-zero indicates bug)"
+            );
+        } else if overhead_pct > 25 {
+            tracing::warn!(
+                pid,
+                alloc_count,
+                device_idx,
+                drm_resident_mib,
+                non_hip_mib,
+                tracked_bytes,
+                tracked_count,
+                effective_limit_mib,
+                total_overhead_mib,
+                overhead_pct,
+                "HIGH OVERHEAD: non-hipMalloc overhead is {overhead_pct}% of mem_limit \
+                 ({total_overhead_mib} MiB across all processes)"
             );
         } else {
             tracing::info!(
                 pid,
                 alloc_count,
                 device_idx,
-                our_shm = our_used,
-                real_vram = real_used,
+                drm_resident_mib,
+                non_hip_mib,
                 tracked_bytes,
                 tracked_count,
-                shm_vs_real_mib,
-                tracker_vs_shm_mib,
-                "reconciliation check"
+                effective_limit_mib,
+                total_overhead_mib,
+                "reconciliation"
             );
         }
+    }
+
+    /// Sum non-hipMalloc overhead across all active proc slots for a device and write
+    /// the resulting effective limit to SHM. Used by both reconciliation and reaping.
+    fn recalculate_effective_limit(
+        &self,
+        ps: &ProcSlotHandle,
+        state: &SharedDeviceState,
+        device_idx: usize,
+    ) {
+        let mem_limit = state
+            .with_device_v2_or(device_idx, |device| device.device_info.get_mem_limit())
+            .unwrap_or(0);
+        if mem_limit == 0 {
+            return;
+        }
+        let total_overhead = ps.sum_non_hip_for_device(device_idx);
+        let effective = mem_limit.saturating_sub(total_overhead);
+        state.with_device_v2_or(device_idx, |device| {
+            device.device_info.set_effective_mem_limit(effective);
+        });
+    }
+
+    /// Write this process's non-hipMalloc overhead to its proc slot, sum across all
+    /// active slots, and update the effective memory limit in SHM.
+    ///
+    /// Returns `(total_overhead_mib, effective_limit_mib)` for logging.
+    fn update_effective_limit(
+        &self,
+        device_idx: usize,
+        non_hip_bytes: u64,
+        mem_limit: u64,
+    ) -> (u64, u64) {
+        let Some(ref ps) = self.proc_slots else {
+            if non_hip_bytes > 0 {
+                tracing::warn!(
+                    non_hip_mib = non_hip_bytes / (1024 * 1024),
+                    "Overhead enforcement degraded: no proc slot available, \
+                     effective_mem_limit not updated"
+                );
+            }
+            return (0, mem_limit / (1024 * 1024));
+        };
+
+        // Write our overhead to our proc slot
+        ps.write_non_hip(device_idx, non_hip_bytes);
+
+        // Recalculate effective limit from all active slots
+        if let Ok(handle) = self.get_or_init_shared_memory() {
+            self.recalculate_effective_limit(ps, handle.get_state(), device_idx);
+        }
+
+        let total_overhead = ps.sum_non_hip_for_device(device_idx);
+        let total_overhead_mib = total_overhead / (1024 * 1024);
+        let effective_mib = mem_limit.saturating_sub(total_overhead) / (1024 * 1024);
+        (total_overhead_mib, effective_mib)
     }
 
     /// Record a free: look up the pointer's size, decrement SHM pod_memory_used.
@@ -647,6 +837,13 @@ impl Limiter {
                 count = reaped.len(),
                 "Reaped dead process(es) from proc slots"
             );
+
+            // Recalculate effective limits for ALL mapped devices. Reaped slots may have
+            // had non_hip overhead on devices where they had zero hipMalloc usage, so we
+            // can't rely on the `used` array to determine which devices are affected.
+            for &(device_idx, _) in &self.gpu_idx_uuids {
+                self.recalculate_effective_limit(ps, state, device_idx);
+            }
         }
 
         reaped.len()

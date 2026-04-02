@@ -373,3 +373,94 @@ class TestStandaloneForkSafety:
             f"Sysfs/HIP device mismatch detected:\n{output}"
         assert "sysfs matches HIP device order" in output, \
             f"Expected verification log:\n{output}"
+
+
+def test_reconciliation_reaps_dead_process_overhead():
+    """Verify that reconciliation reaps stale non_hip overhead from dead processes.
+
+    Scenario that caused 84% phantom overhead in CI (hnsnl pod):
+    1. Process A starts, does 100+ allocs (triggers reconciliation → writes non_hip to proc slot)
+    2. Process A is SIGKILLed (no drain → stale non_hip remains in proc slot)
+    3. Process B starts, does 100+ allocs (triggers reconciliation → reap runs → clears stale slot)
+
+    We verify "Reaped dead process" appears in process B's logs, confirming
+    the reconciliation path triggers reap.
+    """
+    script_a = """\
+        import signal, os
+        from hip_helper import HIPRuntime
+        hip = HIPRuntime()
+        ptrs = []
+        for _ in range(101):
+            ptrs.append(hip.malloc(1024))
+        # SIGKILL ourselves — no atexit drain, stale proc slot remains
+        os.kill(os.getpid(), signal.SIGKILL)
+    """
+    script_b = """\
+        from hip_helper import HIPRuntime
+        hip = HIPRuntime()
+        ptrs = []
+        for _ in range(101):
+            ptrs.append(hip.malloc(1024))
+        for p in ptrs:
+            hip.free(p)
+        print("PASS")
+    """
+    with tempfile.TemporaryDirectory(prefix="cts_reap_") as tmpdir:
+        shm_dir = os.path.join(tmpdir, "shm")
+        os.makedirs(shm_dir, exist_ok=True)
+        env = _standalone_env(shm_dir, mem_limit="1G",
+                              extra_env={"TF_LOG_PATH": "stderr"})
+        cts_dir = os.path.dirname(os.path.abspath(__file__))
+
+        # Process A: allocate then SIGKILL (leaves stale proc slot)
+        script_a_path = os.path.join(tmpdir, "script_a.py")
+        with open(script_a_path, "w") as f:
+            f.write(textwrap.dedent(script_a))
+        proc_a = subprocess.run(
+            [sys.executable, script_a_path],
+            capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT,
+            env=env, cwd=cts_dir,
+        )
+        assert proc_a.returncode == -9, \
+            f"Process A should have been SIGKILLed, got rc={proc_a.returncode}"
+
+        # Process B: allocate (triggers reconciliation → reap)
+        script_b_path = os.path.join(tmpdir, "script_b.py")
+        with open(script_b_path, "w") as f:
+            f.write(textwrap.dedent(script_b))
+        proc_b = subprocess.run(
+            [sys.executable, script_b_path],
+            capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT,
+            env=env, cwd=cts_dir,
+        )
+        assert proc_b.returncode == 0, f"Process B failed: {proc_b.stderr}"
+        output_b = proc_b.stdout + proc_b.stderr
+        assert "Reaped dead process" in output_b, \
+            f"Expected reap during reconciliation:\n{output_b}"
+
+
+def test_high_overhead_warning():
+    """Verify HIGH OVERHEAD warning fires when non-hipMalloc overhead > 25% of mem_limit.
+
+    Strategy: set mem_limit very low (3M ≈ 2.8 MiB) so that the kernel's baseline
+    VRAM overhead (~2 MiB for context + page tables) exceeds 25% of the limit.
+    Then do 100 small allocs to trigger reconciliation, which measures DRM
+    resident vs tracked and should log the warning.
+    """
+    script = """\
+        from hip_helper import HIPRuntime
+        hip = HIPRuntime()
+        ptrs = []
+        for _ in range(101):
+            ptrs.append(hip.malloc(1024))
+        for p in ptrs:
+            hip.free(p)
+        print("PASS")
+    """
+    result = _run_standalone(script, mem_limit="3M",
+                             extra_env={"TF_LOG_PATH": "stderr"})
+    assert result.returncode == 0, f"Failed: {result.stderr}"
+    output = result.stdout + result.stderr
+    assert "HIGH OVERHEAD" in output, \
+        f"Expected HIGH OVERHEAD warning in logs:\n{output}"
